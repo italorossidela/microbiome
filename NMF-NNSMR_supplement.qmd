@@ -1,0 +1,905 @@
+---
+title: "Microbiome Data Analysis Using Biclustering Approaches - NMF-initialized Nonnegative Sparse Matrix Regression"
+author: "Italo Rossi del Aguila"
+format: pdf
+editor: visual
+---
+
+```{r load_pk, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+#library(vegan) #for rarefaction
+#library(ape) #for PCoA
+#library(compositions)
+#library(fossil)
+
+library(NMF)
+library(ggtext)
+library(reshape2)
+
+```
+
+# Data Set
+
+### Load data
+
+During import, transpose to place samples on the rows and taxa on the columns. Load metadata for labeling and coloring plots.
+
+```{r data_load, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+X <- read.delim("data/microbiome_dataSet1.tsv",row.names=1)
+X <- t(as.matrix(X))
+X_meta <- read.delim("data/microbiome_dataSet1_sampleInfo.tsv",row.names=1)
+X_taxo <- read.delim("data/microbiome_dataSet1_taxonomy.tsv",row.names=1)
+```
+
+### Basic Filtering
+
+Find any null/NA values and set them to 0. Eliminate all-zero rows and columns. Check for any negative values.
+
+```{r data_trns, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#NAs to zeros
+X[is.na(X)] <- 0
+
+#remove all-zero samples
+aux_allzero <- which(rowSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[-aux_allzero,]
+}
+
+#remove all-zero taxa
+aux_allzero <- which(colSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[,-aux_allzero]
+}
+
+rm(aux_allzero)
+
+if(any(X<0)){
+  print("X has negative values. DO NOT CONTINUE.")
+}
+
+I <- dim(X)[1]; J <- dim(X)[2]
+```
+
+### Filtering rare taxa
+
+Find and remove rare taxa: OTUs with only one count across all samples
+
+```{r EDA_filter}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_rare <- which(colSums(X)==1)
+X <- X[,-aux_rare]
+
+#update dimension variables
+I <- dim(X)[1]; J <- dim(X)[2]
+
+rm(aux_rare)
+```
+
+### Preprocessing
+
+#### Square root transformation
+
+Back-up X, perform a square-root transfornation for variance stabilization.
+
+```{r trns_sqrt}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xorig <- X
+Xsqrt <- sqrt(X)
+X <- Xsqrt
+```
+
+# Sparse Matrix Regression - Multiple Runs
+
+## Global objects
+
+```{r SMR_global}
+
+#set maximum number of iterations. define small number.
+iter.max <- 1000
+smallnum <- 1e-6
+
+#list to store line search parameters:
+lineparam <- vector("list", length = 5)
+names(lineparam) <- c("Delta", "acc_pow", "acc_fail", "max_fail", "it")
+
+#list with all biclusters
+biclusters <- vector("list")
+
+#list for each bicluster, with 7 objects each
+rows <- list()
+cols <- list()
+A <- list()
+B <- list()
+C <- list()
+C_hat <- list()
+R <- list()
+
+runs_bc <- list()
+biclusters_sub <- list('rows'=rows,'cols'=cols,'A'=A, 'B'=B, 'C'=C, 'C_hat'=C_hat, 'R'=R)
+
+
+#create stats tables
+stats_run <- matrix(nrow=0,ncol=7)
+aux_colnames <- c('nrun','mnr','mnc','biclusters','rows_all','cols_all','time')
+colnames(stats_run) <- aux_colnames
+
+stats_run_summ <- matrix(nrow=0,ncol=12)
+aux_colnames <- c('rows.min','rows.q1','rows.median','rows.mean','rows.q3','rows.max','cols.min','cols.q1','cols.median','cols.mean','cols.q3','cols.max')
+colnames(stats_run_summ) <- aux_colnames
+
+stats_bc <- matrix(nrow=0,ncol=10)
+aux_colnames <- c('nrun','bc','rows','cols','SSRnorm','loss','lambda','time_s','X_sparsity','time_init')
+stats_bc <-as.data.frame(stats_bc)
+colnames(stats_bc) <- aux_colnames
+
+stats_fit <- matrix(nrow=0,ncol=10)
+aux_colnames <- c('nrun','bc','fit','rows','cols','loss','lambda','norm_t','A_t','B_t')
+stats_fit <- as.data.frame(stats_fit)
+colnames(stats_fit) <- aux_colnames
+
+rm(rows,cols,A,B,C,C_hat,R,aux_colnames)
+```
+
+## Functions
+
+Adapted from MATLAB implementation of Bro et al. (2012)
+
+### NNSMR
+
+Taking the data matrix **X**, the lambda value for the current iteration, and two factors, leaves one factor fixed and fits the other.
+
+Inputs:
+
+-   X: data matrix
+
+-   A: "left" factor, to remain fixed
+
+-   B: "right" factor, to be updated
+
+-   $\lambda$: sparsity-inducing L1 penalty
+
+Returns:
+
+-   Updated "right" factor, fitted for **X** using $\lambda$ and a fixed "left" A factor
+
+```{r SMR_func_NNSMR}
+
+NNSMR <- function(X,A,B,lambda){
+  
+  I <- dim(X)[1]; J <- dim(X)[2]
+  I <- dim(A)[1]; F <- dim(A)[2]
+  
+  maxit <- iter.max
+  convcrit <- smallnum
+  it <- 0
+  Oldfit <- 1e100
+  Diff <- 1e100
+  
+  AtA <-t(A) %*% A
+  alpha <- t(diag(AtA))
+  AtX <- t(A) %*% X
+  normXsqr <- sum(X^2)
+
+  
+  while(Diff>convcrit && it <maxit){
+    it <- it+1
+    for(j in 1:J){
+      for(f in 1:F){
+        data <- AtX[f,j] - sum(AtA[f,]*t(B[j,])) + alpha[f]%*%B[j,f]
+
+        if(data - lambda/2 > 0){
+          B[j,f] <- (data - lambda/2)/alpha[f]
+        }else{
+          B[j,f] <- 0
+        }
+      }
+    }
+    AtB <- A%*%t(B)
+
+    fit <- normXsqr + sum(AtB^2) - 2*sum(X*AtB) + lambda*sum(abs(B))
+    
+    Diff <- abs(Oldfit - fit)
+    Oldfit <- fit
+  }
+  return(B)
+}
+```
+
+### Loss and Frobenius Norm
+
+Inputs:
+
+-   X: data matrix
+
+-   A and B: sparse factor vectors
+
+-   $\lambda$: sparsity-inducing L1 penalty
+
+Returns:
+
+-   new_norm: $$
+    \| \mathbf{X}-\mathbf{AB}^\mathit{T}\|_F^2+\lambda\sum\limits_{i,k}|\mathbf{A}_{\mathit{ik}}|+\lambda\sum\limits_{j,k}|\mathbf{B}_{\mathit{jk}}|
+    $$
+
+```{r func_lossval}
+lossval <- function(X,A,B,lambda){
+  
+  term_norm <-norm(X-A%*%t(B),type='F')^2
+  term_A <- lambda*sum(colSums(abs(A)))
+  term_B <- lambda*sum(colSums(abs(B)))
+  new_norm <- term_norm + term_A + term_B
+  
+  lossval_out <- vector("list",4)
+  lossval_out[[1]] <- new_norm
+  lossval_out[[2]] <- term_norm
+  lossval_out[[3]] <- term_A
+  lossval_out[[4]] <- term_B
+  
+  return(lossval_out)
+}
+```
+
+### Extrapolation
+
+```{r func_extrapol}
+extrapol <- function(A,Ao,delta){
+  
+  if(is.list(A)){
+    aux_lists <- length(A)
+    dA <- vector("list",aux_lists)
+    for(i in 1:aux_lists){
+      dA[[i]] <- A[[i]]
+      aux_dimA <- max(dim(A[[i]]))
+      for(j in 1:aux_dimA){
+        dA[[i]][j] <- Ao[[i]][j]+delta*(A[[i]][j]-Ao[[i]][j])
+      }
+    }
+    rm(aux_dimA)
+    return(dA)
+  }else{
+    dA <- A
+    aux_dimA <- max(dim(A))
+    for(i in 1:aux_dimA){
+      dA[i] <- Ao[i]+delta*(A[i]-Ao[i])
+    }
+    rm(aux_dimA)
+    return(dA)
+  }
+}
+```
+
+### Line Search
+
+Inputs:
+
+-   X: data matrix
+
+-   A and B: sparse factor vectors
+
+-   Ao and Bo: "old" sparse factor vectors
+
+```{r func_linesrch}
+linesrch <- function(X,A,Ao,B,Bo,lambda,lineparam){
+  acc_pow <- as.numeric(lineparam['acc_pow'])
+  acc_fail <- as.numeric(lineparam['acc_fail'])
+  max_fail <- as.numeric(lineparam['max_fail'])
+  it <- as.numeric(lineparam['it'])
+  
+  lossval_out <-lossval(X,A,B,lambda)
+  Fitnow <- lossval_out[[1]]
+  acc <- 0
+  dL <- extrapol(list(A,B),list(Ao,Bo),max(log(it),2)^(1/acc_pow))
+  lossval_out <-lossval(X,dL[[1]],dL[[2]],lambda)
+  Fitnew <- lossval_out[[1]]
+  
+  if(Fitnew>Fitnow){
+    acc_fail <- acc_fail+1
+    dL <- list(A,B)
+    if(acc_fail==max_fail){
+      acc_pow <- acc_pow+1+1
+      acc_fail <- 0
+    }
+  }
+  linesrch_out <- vector("list",2)
+  linesrch_out[[1]] <- dL[[1]]
+  linesrch_out[[2]] <- dL[[2]]
+  lineparam['acc_pow'] <- acc_pow
+  lineparam['acc_fail'] <- acc_fail
+  lineparam['max_fail'] <- max_fail
+  linesrch_out[[3]] <- lineparam
+  
+  return(linesrch_out)
+}
+```
+
+### Sparse Matrix Regression (SMR)
+
+Solves:
+
+$$
+\| \mathbf{X}-\mathbf{AB}^\mathit{T}\|_F^2+\lambda\sum\limits_{i,k}|\mathbf{A}_{\mathit{ik}}|+\lambda\sum\limits_{j,k}|\mathbf{B}_{\mathit{jk}}|
+$$
+
+Updating factors A and B by performing a line search.
+
+Inputs:
+
+-   X: data matrix
+
+-   k: Factorization rank (k=1 to find a single cluster)
+
+-   $\lambda$
+
+-   NMF-initialized factors A and B
+
+Outputs:
+
+-   Updated factors A and B
+
+-   loss
+
+-   Boolean flag indicating whether the solution is rank-deficient.
+
+```{r func_SMR}
+SMR <- function(X,k,lambda,A,B){
+  lineparam['Delta'] <- 4
+  lineparam['acc_pow'] <- 2
+  lineparam['acc_fail'] <- 0
+  lineparam['max_fail'] <- 4
+  
+  lossval_out <- lossval(X,A,B,lambda)
+  new_norm <- lossval_out[[1]]
+  old_norm <- new_norm + 10^10
+
+  iter.count <- 1
+  while(abs(new_norm-old_norm)>smallnum && iter.count < iter.max){
+    Ao <- A; Bo <- B
+    iter.count <- iter.count + 1
+
+    B<-NNSMR(X,A,B,lambda)
+    A<-NNSMR(t(X),B,A,lambda)
+
+    old_norm <- new_norm
+    lossval_out <- lossval(X,A,B,lambda)
+    new_norm <- lossval_out[[1]]
+    
+    # line search every second iteration:
+    if(iter.count/2 == round(iter.count/2) && iter.count>5){
+      lineparam['it']<-iter.count
+      linesrch_out <- linesrch(X,A,Ao,B,Bo,lambda,lineparam)
+      A <- linesrch_out[[1]]
+      B <- linesrch_out[[2]]
+      lineparam <- linesrch_out[[3]]
+      
+      lossval_out <- lossval(X,A,B,lambda)
+      new_norm <- lossval_out[[1]]
+    }
+  }
+  
+  loss <- lossval_out
+  
+  if(any(colSums(abs(A))<.Machine$double.eps*100)|
+     any(colSums(abs(B))<.Machine$double.eps* 100)){
+    rankdef <- 1
+  }else{
+    rankdef <- 0
+  }
+  return(list(A,B,loss,rankdef))
+}
+```
+
+### Format time string
+
+```{r}
+format_time <- function(seconds) {
+  if (seconds < 60) {
+    return(paste(round(seconds, 2), "seconds"))
+  } else if (seconds < 3600) {
+    minutes <- seconds / 60
+    return(paste(round(minutes, 2), "minutes"))
+  } else {
+    hours <- seconds / 3600
+    return(paste(round(hours, 2), "hours"))
+  }
+}
+```
+
+### Set Global Parameters
+
+```{r lambdas_set}
+
+lambda_min <- 2
+lambda_init <- lambda_min
+lambda_incr <- 2
+lambda_old <- lambda_init
+
+#create bicluster counter
+bc <- 0
+
+mnr_range <- 2:10
+mnc_range <- 2:10
+
+biclusters_empty <- biclusters
+```
+
+## Run sequential NMF-NNSMR loop
+
+```{r main_loop}
+time_global_start <- Sys.time()
+nrun <- 0
+maxrun <- length(mnr_range)*length(mnc_range)
+
+  for(mnr in mnr_range){
+    for(mnc in mnc_range){
+      nrun <- nrun + 1
+      time_run_start <- Sys.time()
+      
+      #reset X, bc counter, lambda, flag
+      X <- Xsqrt
+      bc <- 0
+      biclusters <- biclusters_empty
+
+      lambda_init <- lambda_min
+      lambda_old <- lambda_init
+
+      flag.stopall <- 0
+      print(paste0('Run ',nrun,': mnr=',mnr,' mnc=',mnc))
+        
+      while(!flag.stopall){
+        bc <- bc+1
+        time_bc_start <- Sys.time()
+        
+        #append an empty sublist to store the bicluster's output
+        biclusters <- append(biclusters,list(biclusters_sub))
+        
+        #create empty items to populate fit results: A, B, loss, lambda, rankdef
+        AA <- list()
+        BB <- list()
+        LOSS <- c()
+        LAMBDA <- c()
+      
+        #reset fit flag (set to 1 on all-zero factor(s) found)
+        flag.sparse <- 0
+        
+        
+        #### INITIALIZATION ####
+        time_init_start <- Sys.time()
+        
+      #  if(bc==1){
+      #    lambda <- lambda_init
+      #  }else{
+      #    aux_fits <- stats_fit[stats_fit$bc==bc-1 & stats_fit$rows<m,]
+      #    lambda <- min(aux_fits$lambda)/lambda_incr
+          #rm(aux_fits)
+      #  }
+      
+        lambda <- lambda_init #check how to establish a higher lambda_init
+      
+        aux_sparsity <- round(length(which(round(X)==0))/(I*J),6)
+        
+        loss <- 1e100
+        #print(paste0("    Initializing: rank-1 NMF on X (sparsity=",aux_sparsity,")"))
+        nmf_X <- nmf(X,1)
+        A <- nmf_X@fit@W
+        B <- nmf_X@fit@H
+        B <- t(B)
+        time_init_end <- Sys.time()
+        time_init <- round(as.numeric(difftime(time_init_end, time_init_start, units = "secs")),4)
+        #print(paste0("    Finished initialization in ",time_init,"s"))
+          
+        ### COMPUTE FITS ###
+        fitcount <- 0
+        
+        # while no all-zero factor result is reached
+        while(!flag.sparse){
+          time_fit_start <- Sys.time()
+      
+          # back up A, B, loss to _old objects (from initialization or previous SMR)
+          A_old <- A; B_old <- B; loss_old <- loss
+          
+          fitcount <- fitcount + 1
+          SMR_out <- SMR(X,1,lambda,A,B)
+          
+          A <- SMR_out[[1]]
+          B <- SMR_out[[2]]
+          loss <- SMR_out[[3]][[1]]
+          term_norm <- SMR_out[[3]][[2]]
+          term_A <- SMR_out[[3]][[3]]
+          term_B <- SMR_out[[3]][[4]]
+          rankdef <- SMR_out[[4]]
+          
+          if(rankdef){
+            # if all-zero factor(s) found, try scaling lambda
+            #print(paste0('    All-zero factor(s) found using λ=',lambda,' trying lower λ:'))
+            lambda_old <- lambda/lambda_incr
+            deltaLAMB <- abs(lambda-lambda_old)
+            aux_j <- c(0.75, 0.5, 0.25)
+            for(j in aux_j){ #try different scalars to decrease lambda
+              if(rankdef){
+                lambda <- lambda_old + deltaLAMB*j #decrease lambda
+                #print(paste0('    trying λ=',round(lambda,4)))
+                SMR_out <- SMR(X,1,lambda,A,B)
+                #get new A, B, loss, rankdef using decreased lambdaA
+                A <- SMR_out[[1]]
+                B <- SMR_out[[2]]
+                loss <- SMR_out[[3]][[1]]
+                term_norm <- SMR_out[[3]][[2]]
+                term_A <- SMR_out[[3]][[3]]
+                term_B <- SMR_out[[3]][[4]]
+                rankdef <- SMR_out[[4]]
+              }
+            }
+            if(rankdef){ #if A or B are still all-zero after decreased lambdas, stop
+              #print(paste0('    No solution found with λ>',round(lambda_old,4)))
+              flag.sparse <- 1
+              A <- A_old
+              B <- B_old
+              loss <- loss_old
+              flag.stopped <- 1
+            }
+          }
+          
+          # only for non-rank-deficient solutions:
+          if(!rankdef){
+            # count the number of nonzero positions in the factors
+            aux_A_nz <- length(which(A!=0))
+            aux_B_nz <- length(which(B!=0))
+            if(aux_A_nz>=mnr & aux_B_nz>=mnc){
+              #if factors <= mnr, mnc -> store fit results
+              AA[[fitcount]] <- A
+              BB[[fitcount]] <- B
+              LOSS[fitcount] <- loss
+              LAMBDA[fitcount] <- lambda
+            }
+          }
+          if(term_A!=0 & term_B!=0){
+            #store fit stats
+            aux_stats_fit_row <-c(nrun,bc,fitcount,aux_A_nz,aux_B_nz,loss,lambda,term_norm,term_A,term_B)
+            aux_colnames <- c('nrun','bc','fit','rows','cols','loss','lambda','norm_t','A_t','B_t')
+            
+            stats_fit <- rbind(stats_fit,aux_stats_fit_row)
+            colnames(stats_fit) <- aux_colnames
+            time_fit_end <- Sys.time()
+            time_fit <- round(as.numeric(difftime(time_fit_end, time_fit_start, units = "secs")),4)
+            #print(paste0("    Fit ",fitcount," (λ=",round(lambda,4),") completed in ",time_fit,"s"))
+          }
+            
+            lambda_old <- lambda
+            lambda <- max(lambda,lambda_init)*lambda_incr
+          }
+        
+        if(length(AA)==0){
+          print(paste0('NO SOLUTION FOR CLUSTER ',bc,'. STOP RUN.'))
+          flag.stopall <- 1
+        }else{
+          #compute SSR of fits
+          XHATT <- list() #Xhat = A*t(B)
+          CHATT <- list()    #subset of Xhat
+          CC <- list()    #subset of Xsqrt
+          RR <- list()
+          SSR <- c()
+          for(i in 1:length(AA)){
+            #Xhat = A*t(B)
+            XHATT[[i]] <- AA[[i]] %*% t(BB[[i]])
+            
+            #get rows and columns from factors
+            aux_rows <- which(AA[[i]]!=0)
+            aux_cols <- which(BB[[i]]!=0)
+            
+            #subset of Xhat
+            CHATT[[i]] <- as.data.frame(XHATT[[i]][aux_rows,aux_cols])
+            
+            #subset of Xsqrt
+            CC[[i]] <- as.data.frame(Xsqrt[aux_rows,aux_cols])
+            
+            #residuals matrix
+            RR[[i]] <- CC[[i]]-CHATT[[i]]
+            
+            SSR[i] <- sum(RR[[i]]^2)
+          }
+          
+          #compute adjusted SSR of fits
+          SSRnorm <- c()
+          aux_fits <- stats_fit[stats_fit$nrun==nrun,]
+          aux_fits <- aux_fits[aux_fits$bc==bc,]
+          for(i in 1:length(RR)){
+            aux_nrow <- aux_fits[i,'rows']
+            aux_ncol <- aux_fits[i,'cols']
+            SSRnorm[i] <- SSR[i] * (aux_nrow*aux_ncol)/(aux_nrow+aux_ncol)
+          }
+          aux_SSRnorm_min <- which.min(SSRnorm)
+          aux_SSR_min <- which.min(SSR)
+          
+          aux_loss <- aux_fits[aux_fits$fit==aux_SSRnorm_min,'loss']
+          aux_lambda <- aux_fits[aux_fits$fit==aux_SSRnorm_min,'lambda']
+          
+          aux_A_nz <- which(AA[[aux_SSRnorm_min]]!=0)
+          aux_B_nz <- which(BB[[aux_SSRnorm_min]]!=0)
+          biclusters[[bc]][["rows"]] <- aux_A_nz
+          biclusters[[bc]][["cols"]] <- aux_B_nz
+          biclusters[[bc]][["A"]] <- AA[[aux_SSRnorm_min]]
+          biclusters[[bc]][["B"]] <- BB[[aux_SSRnorm_min]]
+          biclusters[[bc]][["C"]] <- as.data.frame(CC[[aux_SSRnorm_min]])
+          biclusters[[bc]][["C_hat"]] <- as.data.frame(CHATT[[aux_SSRnorm_min]])
+          biclusters[[bc]][["R"]] <- as.data.frame(RR[[aux_SSRnorm_min]])
+          
+          for(r in aux_A_nz){
+            for(c in aux_B_nz){
+              X[r,c] <- smallnum^2
+            }
+          }
+        
+          time_bc_end <- Sys.time()
+          aux_nrow <- length(aux_A_nz)
+          aux_ncol <- length(aux_B_nz)
+          time_bc <- round(as.numeric(difftime(time_bc_end, time_bc_start, units = "secs")),4)
+              print(paste0("    Bicluster ",bc," (",aux_nrow," rows, ",aux_ncol,
+                           " columns) found in ",time_bc,"s"))
+          
+          aux_stats_bc_row <-c(nrun,bc,aux_nrow,aux_ncol,min(SSRnorm),aux_loss,aux_lambda,time_bc,aux_sparsity,time_init)
+          aux_colnames <- c('nrun','bc','rows','cols','SSRnorm','loss','lambda','time_s',
+                            'X_sparsity','time_init')
+          #print(paste('dim(aux_stats_bc_row)',length(aux_stats_bc_row)))    
+          stats_bc <- rbind(stats_bc,aux_stats_bc_row)
+          colnames(stats_bc) <- aux_colnames    
+        }
+      
+        
+      }
+      
+      if(flag.stopall){
+        biclusters[[bc]] <- NULL
+        bc <- bc-1
+      }
+      
+      time_run_end <- Sys.time()
+      
+            n_biclust <- length(biclusters)
+            if(n_biclust>0){
+              print('analyzing found biclusters...')
+        
+              #get the rows and columns in the biclusters
+              bc_allrows <- c()
+              bc_allcols <- c()
+      
+              for(i in 1:n_biclust){
+                bc_rows <- biclusters[[i]][["rows"]]
+                bc_cols <- biclusters[[i]][["cols"]]
+                bc_allrows <- append(bc_allrows,bc_rows)
+                bc_allcols <- append(bc_allcols,bc_cols)
+                bc_allrows <- unique(bc_allrows)
+                bc_allcols <- unique(bc_allcols)
+              }
+      
+              n_rows <- length(unique(bc_allrows))
+              n_cols <- length(unique(bc_allcols))
+            }
+      
+      
+      time_run <- round(as.numeric(difftime(time_run_end, time_run_start, units = "secs")),4)
+      
+      time_string <- format_time(time_run)
+      
+      print(paste('found',n_rows,'rows and',n_cols,'columns across',n_biclust,'biclusters in', time_string))
+      
+      #print(paste0(if(I-n_rows>0){paste(I-n_rows,' rows')}else{paste('')},
+      #            if(J-n_cols>0){paste(J-n_cols,' columns')}else{paste('')},
+      #            ' are not part of any biclusters'))
+
+      
+      if(n_biclust>0){
+        #print('      storing found biclusters and run stats...')
+        #store biclusters:
+        runs_bc[[nrun]] <- biclusters
+  
+        #get the rows and columns in the biclusters
+        bc_allrows <- c()
+        bc_allcols <- c()
+        for(i in 1:length(biclusters)){
+          bc_allrows <- append(bc_allrows,biclusters[[i]][["rows"]])
+          bc_allcols <- append(bc_allcols,biclusters[[i]][["cols"]])
+          }
+        n_rows <- length(unique(bc_allrows))
+        n_cols <- length(unique(bc_allcols))
+      }else{
+        #print('      storing run stats...')
+        n_rows <- 0
+        n_cols <- 0
+      }
+            
+      #store run stats:
+      aux_stats_run_row <- c(nrun,mnr,mnc,n_biclust,n_rows,n_cols,time_run)
+      aux_colnames <- c('nrun','mnr','mnc','biclusters','rows_all','cols_all','time')
+      colnames(stats_run) <- aux_colnames
+      stats_run <- rbind(stats_run,aux_stats_run_row)
+      
+      #progress
+      aux_pc <- round(nrun/maxrun*100,2)
+      print(paste0('      run ',nrun,'/',maxrun,' completed (',aux_pc,'%)'))
+
+    }
+  }
+
+
+
+
+
+
+
+time_global_end <- Sys.time()
+time_global <- round(as.numeric(difftime(time_global_end, time_global_start, units = "secs")),4)
+
+#display time in seconds
+print(paste('performed',nrun,'runs with different combinations of mnr, mnc in',time_global,'s'))
+
+#converts time to minutes if >60 seconds, to hours if >60 minutes
+time_string <- format_time(time_global)
+#display reformatted time
+print(paste('performed',nrun,'runs with different combinations of mnr, mnc in', time_string))
+stats_run <- as.data.frame(stats_run)
+
+write.csv(stats_bc,"data/NMF-NNSMR-stats_bc-16SIBD.csv", row.names = TRUE)
+write.csv(stats_run,"data/NMF-NNSMR-stats_run-16SIBD.csv", row.names = TRUE)
+
+
+rm(aux_A_nz,aux_B_nz,aux_colnames,aux_cols,aux_rows,aux_ncol,aux_nrow,aux_sparsity,aux_SSR_min,aux_SSRnorm_min,aux_stats_bc_row,aux_stats_fit_row,aux_j,aux_loss,aux_lambda,aux_fits)
+rm(bc,c,deltaLAMB,fitcount,i,j,r,rankdef,SSR,SSRnorm,term_A,term_B,term_norm)
+rm(time_bc,time_fit,time_init,time_run)
+rm(time_bc_start,time_fit_start,time_init_start,time_run_start)
+rm(time_bc_end,time_fit_end,time_init_end,time_run_end)
+rm(A,A_old,AA,B,B_old,BB,biclusters_sub,CC,CHATT,nmf_X,RR,SMR_out,XHATT)
+```
+
+## Performance Plots
+
+### Focus on found biclusters across runs
+
+Extract the number of rows and columns from the biclusters found across all runs:
+
+For every run, get summary statistics on the rows and columns of their found biclusters.
+
+```{r stats_run_summ}
+stats_bc<-as.data.frame(stats_bc)
+for(r in 1:nrun){
+  aux_run_bcs <- stats_bc[stats_bc$nrun==r,c('rows','cols')]
+  aux_summ_rows <- summary(aux_run_bcs$rows)
+  aux_summ_cols <- summary(aux_run_bcs$cols)
+  aux_stats_bc_summ_row <- c(aux_summ_rows,aux_summ_cols)
+  stats_run_summ <- rbind(stats_run_summ,aux_stats_bc_summ_row)
+}
+rownames(stats_run_summ) <- c(1:nrow(stats_run_summ))
+```
+
+#### Histograms: clustered rows, columns and run duration
+
+Histograms for runs: biclusters found, clustered rows, clustered columns, total time, average time per bicluster
+
+```{r hist_runs}
+
+#summary: most/least bcs found, time, coverage (found / all rows and cols), overlaps, shortest/longest run
+
+
+hist(stats_run$biclusters,breaks=50,xlab='biclusters',ylab='runs',main='Biclusters found')
+
+
+#filter out outlier number of biclusters
+aux_maxbc <- max(stats_run$biclusters)
+
+hist(stats_run$rows,breaks=50,xlab='no. unique rows',ylab='runs',main='Clustered rows')
+hist(stats_run$cols,breaks=50,xlab='no. unique columns',ylab='runs',main='Clustered columns')
+hist(stats_run$time,breaks=50,xlab='time (s)',ylab='runs',main='Run duration')
+
+stats_run$time_bc <- stats_run$time/stats_run$biclusters
+hist(stats_run$time_bc,breaks=50,xlab='time (s)',ylab='runs',main='Average time per bicluster')
+
+
+print('summary: biclusters found across all runs')
+summary(stats_run$biclusters)
+print('----------------------------------------')
+print('summary: clustered rows')
+summary(stats_run$rows_all)
+print('----------------------------------------')
+print('summary: clustered columns')
+summary(stats_run$cols_all)
+print('----------------------------------------')
+print('summary: run duration (s)')
+summary(stats_run$time)
+print('----------------------------------------')
+print('summary: average time per bicluster (ms)')
+summary(stats_run$time_bc)
+
+```
+
+#### Scatter plots: effect of mnr and mnc on number of found clusters
+
+```{r plot_bc_mnr_mnc_1}
+plot(stats_run$mnr,stats_run$biclusters,main="Found biclusters by mnr setting",xlab="mnr",ylab="biclusters")
+plot(stats_run$mnc,stats_run$biclusters,main="Found biclusters by mnc setting",xlab="mnc",ylab="biclusters")
+
+```
+
+#### Scatter plots: effect of mnr and mnc on clustered rows and columns
+
+```{r plot_bc_mnr_mnc_2}
+
+plot(stats_run$mnr,stats_run$rows_all,main="Clustered rows by mnr setting",xlab="mnr",ylab="clustered rows")
+plot(stats_run$mnr,stats_run$cols_all,main="Clustered columns by mnr setting",xlab="mnr",ylab="clustered columns")
+plot(stats_run$mnc,stats_run$rows_all,main="Clustered rows by mnc setting",xlab="mnc",ylab="clustered rows")
+plot(stats_run$mnc,stats_run$cols_all,main="Clustered columns by mnc setting",xlab="mnc",ylab="clustered columns")
+
+```
+
+### Focus on time
+
+#### Effect of run time on the number of biclusters found
+
+```{r}
+plot(stats_run$time,stats_run$biclusters,main='Run duration by biclusters found',xlab='time (s)',ylab='biclusters')
+
+
+```
+
+#### Effect of mnr
+
+```{r scatter_time_mnr}
+#par(mfrow = c(2,2))
+
+plot(stats_run$mnr,stats_run$time,main='Run duration by mnr',xlab='mnr',ylab='time (s)')
+plot(stats_run$mnr,stats_run$time_bc,main='Average time per bicluster by mnr',xlab='mnr',ylab='average time per bicluster (s)')
+
+
+
+
+
+
+
+```
+
+#### Effect of mnc
+
+```{r scatter_time_mnc}
+#par(mfrow = c(2,2))
+
+plot(stats_run$mnc,stats_run$time,main='Run duration by mnc',xlab='mnc',ylab='time (s)')
+plot(stats_run$mnc,stats_run$time_bc,main='Average time per bicluster by mnc',xlab='mnc',ylab='average time per bicluster (s)')
+
+
+
+
+
+
+
+```
+
+a
+
+## Save R environment
+
+```{r env_save}
+save.image(file = "data/NMF-NNSMR-supplement-16SIBD.RData", compress = TRUE)
+```
+
+```{r env_load}
+load(file = "data/NMF-NNSMR-supplement-16SIBD.RData")
+```
+
+aa

@@ -1,0 +1,1535 @@
+---
+title: "Microbiome Data Analysis Using Biclustering Approaches - NMF-initialized Nonnegative Sparse Matrix Regression"
+author: "Italo Rossi del Aguila"
+format: pdf
+editor: visual
+---
+
+```{r load_pk, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+#library(vegan) #for rarefaction
+#library(ape) #for PCoA
+#library(compositions)
+#library(fossil)
+
+library(NMF)
+library(ggtext)
+library(reshape2)
+
+```
+
+# Data Set
+
+### Load data
+
+During import, transpose to place samples on the rows and taxa on the columns. Load metadata for labeling and coloring plots.
+
+```{r data_load, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+X <- read.delim("data/microbiome_dataSet1.tsv",row.names=1)
+X <- t(as.matrix(X))
+X_meta <- read.delim("data/microbiome_dataSet1_sampleInfo.tsv",row.names=1)
+X_taxo <- read.delim("data/microbiome_dataSet1_taxonomy.tsv",row.names=1)
+```
+
+### Mark ambigous taxonomy as *incertae sedis*
+
+To facilitate taxonomic-level analyses, we will update all ambiguous labels as incertae sedis.
+
+```{r data_load_factors, iclude=FALSE}
+#back up original taxonomy table
+X_taxo_old <- X_taxo
+
+#update all ambiguities in phylum, class, order, family and genus
+X_taxo$phylum <- ifelse(grepl("/", X_taxo$phylum), "incertae sedis", X_taxo$phylum)
+X_taxo$phylum <- ifelse(grepl("incertae", X_taxo$phylum, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$phylum)
+X_taxo$class <- ifelse(grepl("/", X_taxo$class), "incertae sedis", X_taxo$class)
+X_taxo$class <- ifelse(grepl("incertae", X_taxo$class, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$class)
+X_taxo$order <- ifelse(grepl("/", X_taxo$order), "incertae sedis", X_taxo$order)
+X_taxo$order <- ifelse(grepl("incertae", X_taxo$order, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$order)
+X_taxo$family <- ifelse(grepl("/", X_taxo$family), "incertae sedis", X_taxo$family)
+X_taxo$family <- ifelse(grepl("incertae", X_taxo$family, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$family)
+X_taxo$genus <- ifelse(grepl("/", X_taxo$genus), "incertae sedis", X_taxo$genus)
+X_taxo$genus <- ifelse(grepl("incertae", X_taxo$genus, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$genus)
+
+as.data.frame(table(X_taxo$phylum))
+as.data.frame(table(X_taxo$class))
+as.data.frame(table(X_taxo$order))
+as.data.frame(table(X_taxo$family))
+as.data.frame(table(X_taxo$genus))
+
+#factors for coloring
+#X_meta$diagnosis <- as.factor(X_meta$diagnosis)
+#X_meta$dysbiotic <- as.factor(X_meta$dysbiotic)
+```
+
+### Basic Filtering
+
+Find any null/NA values and set them to 0. Eliminate all-zero rows and columns. Check for any negative values.
+
+```{r data_trns, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#NAs to zeros
+X[is.na(X)] <- 0
+
+#remove all-zero samples
+aux_allzero <- which(rowSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[-aux_allzero,]
+}
+
+#remove all-zero taxa
+aux_allzero <- which(colSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[,-aux_allzero]
+}
+
+rm(aux_allzero)
+
+if(any(X<0)){
+  print("X has negative values. DO NOT CONTINUE.")
+}
+
+I <- dim(X)[1]; J <- dim(X)[2]
+```
+
+### Filtering rare taxa
+
+Find and remove rare taxa: OTUs with only one count across all samples
+
+```{r EDA_filter}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_rare <- which(colSums(X)==1)
+X <- X[,-aux_rare]
+
+#update dimension variables
+I <- dim(X)[1]; J <- dim(X)[2]
+
+rm(aux_rare)
+```
+
+### Preprocessing
+
+#### Square root transformation
+
+Back-up X, perform a square-root transfornation for variance stabilization.
+
+```{r trns_sqrt}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xorig <- X
+Xsqrt <- sqrt(X)
+X <- Xsqrt
+```
+
+Visualize X(original) and square root transformation
+
+```{r plot_heatmaps_X}
+#| echo: false
+#| message: false
+#| warning: false
+
+heatmap(Xorig, Rowv=NA, Colv=NA, scale="none", main="X (filtered)", cexRow=0.5, cexCol=0.1)
+heatmap(Xsqrt, Rowv=NA, Colv=NA, scale="none", main="X (filtered + sqrt transform)", cexRow=0.5, cexCol=0.1)
+```
+
+# Sparse Matrix Regression
+
+## Global objects
+
+```{r SMR_global}
+
+#set maximum number of iterations. define small number.
+iter.max <- 1000
+smallnum <- 1e-6
+
+#list to store line search parameters:
+lineparam <- vector("list", length = 5)
+names(lineparam) <- c("Delta", "acc_pow", "acc_fail", "max_fail", "it")
+
+#list with all biclusters
+biclusters <- vector("list")
+
+#list for each bicluster, with 7 objects each
+rows <- list()
+cols <- list()
+A <- list()
+B <- list()
+C <- list()
+C_hat <- list()
+R <- list()
+
+biclusters_sub <- list('rows'=rows,'cols'=cols,'A'=A, 'B'=B, 'C'=C, 'C_hat'=C_hat, 'R'=R)
+
+
+#create stats tables
+stats_bc <- matrix(nrow=0,ncol=9)
+aux_colnames <- c('bc','rows','cols','SSRnorm','loss','lambda','time_s','X_sparsity','time_init')
+stats_bc <-as.data.frame(stats_bc)
+colnames(stats_bc) <- aux_colnames
+
+stats_fit <- matrix(nrow=0,ncol=9)
+aux_colnames <- c('bc','fit','rows','cols','loss','lambda','norm_t','A_t','B_t')
+stats_fit <- as.data.frame(stats_fit)
+colnames(stats_fit) <- aux_colnames
+
+rm(rows,cols,A,B,C,C_hat,R,aux_colnames)
+```
+
+## Functions
+
+Adapted from MATLAB implementation of Bro et al. (2012)
+
+### NNSMR
+
+Taking the data matrix **X**, the lambda value for the current iteration, and two factors, leaves one factor fixed and fits the other.
+
+Inputs:
+
+-   X: data matrix
+
+-   A: "left" factor, to remain fixed
+
+-   B: "right" factor, to be updated
+
+-   $\lambda$: sparsity-inducing L1 penalty
+
+Returns:
+
+-   Updated "right" factor, fitted for **X** using $\lambda$ and a fixed "left" A factor
+
+```{r SMR_func_NNSMR}
+
+NNSMR <- function(X,A,B,lambda){
+  
+  I <- dim(X)[1]; J <- dim(X)[2]
+  I <- dim(A)[1]; F <- dim(A)[2]
+  
+  maxit <- iter.max
+  convcrit <- smallnum
+  it <- 0
+  Oldfit <- 1e100
+  Diff <- 1e100
+  
+  AtA <-t(A) %*% A
+  alpha <- t(diag(AtA))
+  AtX <- t(A) %*% X
+  normXsqr <- sum(X^2)
+
+  
+  while(Diff>convcrit && it <maxit){
+    it <- it+1
+    for(j in 1:J){
+      for(f in 1:F){
+        data <- AtX[f,j] - sum(AtA[f,]*t(B[j,])) + alpha[f]%*%B[j,f]
+
+        if(data - lambda/2 > 0){
+          B[j,f] <- (data - lambda/2)/alpha[f]
+        }else{
+          B[j,f] <- 0
+        }
+      }
+    }
+    AtB <- A%*%t(B)
+
+    fit <- normXsqr + sum(AtB^2) - 2*sum(X*AtB) + lambda*sum(abs(B))
+    
+    Diff <- abs(Oldfit - fit)
+    Oldfit <- fit
+  }
+  return(B)
+}
+```
+
+### Loss and Frobenius Norm
+
+Inputs:
+
+-   X: data matrix
+
+-   A and B: sparse factor vectors
+
+-   $\lambda$: sparsity-inducing L1 penalty
+
+Returns:
+
+-   new_norm: $$
+    \| \mathbf{X}-\mathbf{AB}^\mathit{T}\|_F^2+\lambda\sum\limits_{i,k}|\mathbf{A}_{\mathit{ik}}|+\lambda\sum\limits_{j,k}|\mathbf{B}_{\mathit{jk}}|
+    $$
+
+```{r func_lossval}
+lossval <- function(X,A,B,lambda){
+  
+  term_norm <-norm(X-A%*%t(B),type='F')^2
+  term_A <- lambda*sum(colSums(abs(A)))
+  term_B <- lambda*sum(colSums(abs(B)))
+  new_norm <- term_norm + term_A + term_B
+  
+  lossval_out <- vector("list",4)
+  lossval_out[[1]] <- new_norm
+  lossval_out[[2]] <- term_norm
+  lossval_out[[3]] <- term_A
+  lossval_out[[4]] <- term_B
+  
+  return(lossval_out)
+}
+```
+
+### Extrapolation
+
+```{r func_extrapol}
+extrapol <- function(A,Ao,delta){
+  
+  if(is.list(A)){
+    aux_lists <- length(A)
+    dA <- vector("list",aux_lists)
+    for(i in 1:aux_lists){
+      dA[[i]] <- A[[i]]
+      aux_dimA <- max(dim(A[[i]]))
+      for(j in 1:aux_dimA){
+        dA[[i]][j] <- Ao[[i]][j]+delta*(A[[i]][j]-Ao[[i]][j])
+      }
+    }
+    rm(aux_dimA)
+    return(dA)
+  }else{
+    dA <- A
+    aux_dimA <- max(dim(A))
+    for(i in 1:aux_dimA){
+      dA[i] <- Ao[i]+delta*(A[i]-Ao[i])
+    }
+    rm(aux_dimA)
+    return(dA)
+  }
+}
+```
+
+### Line Search
+
+Inputs:
+
+-   X: data matrix
+
+-   A and B: sparse factor vectors
+
+-   Ao and Bo: "old" sparse factor vectors
+
+```{r func_linesrch}
+linesrch <- function(X,A,Ao,B,Bo,lambda,lineparam){
+  acc_pow <- as.numeric(lineparam['acc_pow'])
+  acc_fail <- as.numeric(lineparam['acc_fail'])
+  max_fail <- as.numeric(lineparam['max_fail'])
+  it <- as.numeric(lineparam['it'])
+  
+  lossval_out <-lossval(X,A,B,lambda)
+  Fitnow <- lossval_out[[1]]
+  acc <- 0
+  dL <- extrapol(list(A,B),list(Ao,Bo),max(log(it),2)^(1/acc_pow))
+  lossval_out <-lossval(X,dL[[1]],dL[[2]],lambda)
+  Fitnew <- lossval_out[[1]]
+  
+  if(Fitnew>Fitnow){
+    acc_fail <- acc_fail+1
+    dL <- list(A,B)
+    if(acc_fail==max_fail){
+      acc_pow <- acc_pow+1+1
+      acc_fail <- 0
+    }
+  }
+  linesrch_out <- vector("list",2)
+  linesrch_out[[1]] <- dL[[1]]
+  linesrch_out[[2]] <- dL[[2]]
+  lineparam['acc_pow'] <- acc_pow
+  lineparam['acc_fail'] <- acc_fail
+  lineparam['max_fail'] <- max_fail
+  linesrch_out[[3]] <- lineparam
+  
+  return(linesrch_out)
+}
+```
+
+### Sparse Matrix Regression (SMR)
+
+Solves:
+
+$$
+\| \mathbf{X}-\mathbf{AB}^\mathit{T}\|_F^2+\lambda\sum\limits_{i,k}|\mathbf{A}_{\mathit{ik}}|+\lambda\sum\limits_{j,k}|\mathbf{B}_{\mathit{jk}}|
+$$
+
+Updating factors A and B by performing a line search.
+
+Inputs:
+
+-   X: data matrix
+
+-   k: Factorization rank (k=1 to find a single cluster)
+
+-   $\lambda$
+
+-   NMF-initialized factors A and B
+
+Outputs:
+
+-   Updated factors A and B
+
+-   loss
+
+-   Boolean flag indicating whether the solution is rank-deficient.
+
+```{r func_SMR}
+SMR <- function(X,k,lambda,A,B){
+  lineparam['Delta'] <- 4
+  lineparam['acc_pow'] <- 2
+  lineparam['acc_fail'] <- 0
+  lineparam['max_fail'] <- 4
+  
+  lossval_out <- lossval(X,A,B,lambda)
+  new_norm <- lossval_out[[1]]
+  old_norm <- new_norm + 10^10
+
+  iter.count <- 1
+  while(abs(new_norm-old_norm)>smallnum && iter.count < iter.max){
+    Ao <- A; Bo <- B
+    iter.count <- iter.count + 1
+
+    B<-NNSMR(X,A,B,lambda)
+    A<-NNSMR(t(X),B,A,lambda)
+
+    old_norm <- new_norm
+    lossval_out <- lossval(X,A,B,lambda)
+    new_norm <- lossval_out[[1]]
+    
+    # line search every second iteration:
+    if(iter.count/2 == round(iter.count/2) && iter.count>5){
+      lineparam['it']<-iter.count
+      linesrch_out <- linesrch(X,A,Ao,B,Bo,lambda,lineparam)
+      A <- linesrch_out[[1]]
+      B <- linesrch_out[[2]]
+      lineparam <- linesrch_out[[3]]
+      
+      lossval_out <- lossval(X,A,B,lambda)
+      new_norm <- lossval_out[[1]]
+    }
+  }
+  
+  loss <- lossval_out
+  
+  if(any(colSums(abs(A))<.Machine$double.eps*100)|
+     any(colSums(abs(B))<.Machine$double.eps* 100)){
+    rankdef <- 1
+  }else{
+    rankdef <- 0
+  }
+  return(list(A,B,loss,rankdef))
+}
+```
+
+### Format time string
+
+```{r}
+format_time <- function(seconds) {
+  if (seconds < 60) {
+    return(paste(round(seconds, 2), "seconds"))
+  } else if (seconds < 3600) {
+    minutes <- seconds / 60
+    return(paste(round(minutes, 2), "minutes"))
+  } else {
+    hours <- seconds / 3600
+    return(paste(round(hours, 2), "hours"))
+  }
+}
+```
+
+### Off-diagonal max
+
+Input: square IoU matrix comparing biclusters
+
+Output: highest IoU and matching bicluster numbers
+
+```{r func_general}
+#check the highest off-diagonal value of a square matrix
+off_diagonal_max <- function(matrix) {
+  n <- nrow(matrix)
+  aux_max <- -1
+  matches <- list()
+  
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+      if (i != j) {
+        if (matrix[i, j] > aux_max) {
+          aux_max <- matrix[i, j]
+          matches <- list(list(row = i, col = j))
+        } else if (matrix[i, j] == aux_max) {
+          matches <- c(matches, list(list(row = i, col = j)))
+        }
+      }
+    }
+  }
+  
+  return(list(value = aux_max, positions = matches))
+}
+
+```
+
+### Recursive merging
+
+```{r merging_recursive_func}
+
+#jaccard index between two biclusters
+bc_jaccard <- function(bc_i,bc_j,measure){
+  rows_I <- length(intersect(bc_i[['rows']],bc_j[['rows']]))
+  rows_U <- length(union(bc_i[['rows']],bc_j[['rows']]))
+  cols_I <- length(intersect(bc_i[['cols']],bc_j[['cols']]))
+  cols_U <- length(union(bc_i[['cols']],bc_j[['cols']]))
+  
+  rows_jaccard <- rows_I/rows_U
+  cols_jaccard <- cols_I/cols_U
+  
+  return(
+    switch(measure,
+    'rows'=rows_jaccard,
+    'cols'=cols_jaccard,
+    'avg'=mean(c(rows_jaccard,cols_jaccard)))
+  )
+  
+  
+}
+
+
+#merge two biclusters
+bc_merge <- function(bc_i,bc_j){
+  list(
+    rows = union(bc_i[['rows']],bc_j[['rows']]),
+    cols = union(bc_i[['cols']],bc_j[['cols']]),
+    initial_bc = sort(union(bc_i[['initial_bc']],bc_j[['initial_bc']]))
+  )
+}
+
+#recursive merging
+bc_merge_r <- function(biclusters,threshold,measure){
+  n <- length(biclusters)
+  if(n<=1){
+    return(biclusters)
+  }else{
+    print(paste(n,'biclusters left...'))
+    jaccard_matrix <- matrix(0,n,n)
+    for(i in 1:(n-1)){
+      for(j in (i+1):n){
+        #print(paste0('i=',i,' j=',j))
+        jaccard_matrix[i,j] <- bc_jaccard(biclusters[[i]],biclusters[[j]],measure)
+      }
+    }
+    
+    #find the maximum overlap
+    jaccard_max <- max(jaccard_matrix)
+    
+    if(jaccard_max<=threshold){
+      #if no pairs above threshold, return original bicluster list
+      return(biclusters)
+    }else{
+      #find the pair of biclusters to merge
+      max_indices <- which(jaccard_matrix == jaccard_max, arr.ind = TRUE)[1,]
+      i <- max_indices[1]
+      j <- max_indices[2]
+      bc_i <- biclusters[[i]]
+      bc_j <- biclusters[[j]]
+      print(paste('merging biclusters',bc_i$initial_bc,'and',bc_j$initial_bc))
+      #merge biclusters
+      bc_merged <- bc_merge(bc_i,bc_j)
+      
+      #create new biclusters list
+      biclusters_new <- biclusters[-c(i,j)]
+      biclusters_new[[length(biclusters_new) + 1]] <- bc_merged
+      
+      #recursive call
+      bc_merge_r(biclusters_new,threshold,measure)
+    }
+  }
+}
+
+```
+
+## Run sequential NMF-NNSMR loop
+
+```{r lambdas_set}
+
+lambda_min <- 2
+lambda_init <- lambda_min
+lambda_incr <- 2
+lambda_old <- lambda_init
+
+#create bicluster counter
+bc <- 0
+
+mnr <- 4
+mnc <- 3
+
+flag.stopall <- 0
+```
+
+```{r main_loop}
+
+time_loop_start <- Sys.time()
+
+while(!flag.stopall){
+  bc <- bc+1
+  print(paste('Finding bicluster',bc))
+  time_bc_start <- Sys.time()
+  
+  #append an empty sublist to store the bicluster's output
+  biclusters <- append(biclusters,list(biclusters_sub))
+  
+  #create empty items to populate fit results: A, B, loss, lambda, rankdef
+  AA <- list()
+  BB <- list()
+  LOSS <- c()
+  LAMBDA <- c()
+
+  #reset fit flag (set to 1 on all-zero factor(s) found)
+  flag.sparse <- 0
+  
+  
+  #### INITIALIZATION ####
+  time_init_start <- Sys.time()
+  
+#  if(bc==1){
+#    lambda <- lambda_init
+#  }else{
+#    aux_fits <- stats_fit[stats_fit$bc==bc-1 & stats_fit$rows<m,]
+#    lambda <- min(aux_fits$lambda)/lambda_incr
+    #rm(aux_fits)
+#  }
+
+  lambda <- lambda_init #check how to establish a higher lambda_init
+
+  aux_sparsity <- round(length(which(round(X)==0))/(I*J),6)
+  
+  loss <- 1e100
+  print(paste0("    Initializing: rank-1 NMF on X (sparsity=",aux_sparsity,")"))
+  nmf_X <- nmf(X,1)
+  A <- nmf_X@fit@W
+  B <- nmf_X@fit@H
+  B <- t(B)
+  time_init_end <- Sys.time()
+  time_init <- round(as.numeric(difftime(time_init_end, time_init_start, units = "secs")),4)
+  print(paste0("    Finished initialization in ",time_init,"s"))
+    
+  ### COMPUTE FITS ###
+  fitcount <- 0
+  
+  # while no all-zero factor result is reached
+  while(!flag.sparse){
+    time_fit_start <- Sys.time()
+
+    # back up A, B, loss to _old objects (from initialization or previous SMR)
+    A_old <- A; B_old <- B; loss_old <- loss
+    
+    fitcount <- fitcount + 1
+    SMR_out <- SMR(X,1,lambda,A,B)
+    
+    A <- SMR_out[[1]]
+    B <- SMR_out[[2]]
+    loss <- SMR_out[[3]][[1]]
+    term_norm <- SMR_out[[3]][[2]]
+    term_A <- SMR_out[[3]][[3]]
+    term_B <- SMR_out[[3]][[4]]
+    rankdef <- SMR_out[[4]]
+    
+    if(rankdef){
+      # if all-zero factor(s) found, try scaling lambda
+      print(paste0('    All-zero factor(s) found using λ=',lambda,' trying lower λ:'))
+      lambda_old <- lambda/lambda_incr
+      deltaLAMB <- abs(lambda-lambda_old)
+      aux_j <- c(0.75, 0.5, 0.25)
+      for(j in aux_j){ #try different scalars to decrease lambda
+        if(rankdef){
+          lambda <- lambda_old + deltaLAMB*j #decrease lambda
+          print(paste0('    trying λ=',round(lambda,4)))
+          SMR_out <- SMR(X,1,lambda,A,B)
+          #get new A, B, loss, rankdef using decreased lambdaA
+          A <- SMR_out[[1]]
+          B <- SMR_out[[2]]
+          loss <- SMR_out[[3]][[1]]
+          term_norm <- SMR_out[[3]][[2]]
+          term_A <- SMR_out[[3]][[3]]
+          term_B <- SMR_out[[3]][[4]]
+          rankdef <- SMR_out[[4]]
+        }
+      }
+      if(rankdef){ #if A or B are still all-zero after decreased lambdas, stop
+        print(paste0('    No solution found with λ>',round(lambda_old,4)))
+        flag.sparse <- 1
+        A <- A_old
+        B <- B_old
+        loss <- loss_old
+        flag.stopped <- 1
+      }
+    }
+    
+    # only for non-rank-deficient solutions:
+    if(!rankdef){
+      # count the number of nonzero positions in the factors
+      aux_A_nz <- length(which(A!=0))
+      aux_B_nz <- length(which(B!=0))
+      if(aux_A_nz>=mnr & aux_B_nz>=mnc){
+        #if factors <= mnr, mnc -> store fit results
+        AA[[fitcount]] <- A
+        BB[[fitcount]] <- B
+        LOSS[fitcount] <- loss
+        LAMBDA[fitcount] <- lambda
+        #print(paste0('    fit stored:',aux_A_nz,' rows, ',aux_B_nz,' columns'))
+      }else{
+        #print(paste0('    fit not stored:',aux_A_nz,' rows, ',aux_B_nz,' columns'))
+        print('    next λ makes factors too sparse -> clusters too small')
+        flag.sparse <- 1
+      }
+    }
+    if(term_A!=0 & term_B!=0 & !flag.sparse){
+      #store fit stats
+      aux_stats_fit_row <-c(bc,fitcount,aux_A_nz,aux_B_nz,loss,lambda,term_norm,term_A,term_B)
+      aux_colnames <- c('bc','fit','rows','cols','loss','lambda','norm_t','A_t','B_t')
+      
+      stats_fit <- rbind(stats_fit,aux_stats_fit_row)
+      colnames(stats_fit) <- aux_colnames
+      time_fit_end <- Sys.time()
+      time_fit <- round(as.numeric(difftime(time_fit_end, time_fit_start, units = "secs")),4)
+      print(paste0("    Fit ",fitcount," (λ=",round(lambda,4),") completed in ",time_fit,"s"))
+    }
+      
+      lambda_old <- lambda
+      lambda <- max(lambda,lambda_init)*lambda_incr
+    }
+  
+  if(length(AA)==0){
+    print(paste0('NO SOLUTION FOR CLUSTER ',bc,'. STOP ALL.'))
+    flag.stopall <- 1
+  }else{
+    #compute SSR of fits
+    XHATT <- list() #Xhat = A*t(B)
+    CHATT <- list()    #subset of Xhat
+    CC <- list()    #subset of Xsqrt
+    RR <- list()
+    SSR <- c()
+    for(i in 1:length(AA)){
+      #Xhat = A*t(B)
+      XHATT[[i]] <- AA[[i]] %*% t(BB[[i]])
+      
+      #get rows and columns from factors
+      aux_rows <- which(AA[[i]]!=0)
+      aux_cols <- which(BB[[i]]!=0)
+      
+      #subset of Xhat
+      CHATT[[i]] <- as.data.frame(XHATT[[i]][aux_rows,aux_cols])
+      
+      #subset of Xsqrt
+      CC[[i]] <- as.data.frame(Xsqrt[aux_rows,aux_cols])
+      
+      #residuals matrix
+      RR[[i]] <- CC[[i]]-CHATT[[i]]
+      
+      SSR[i] <- sum(RR[[i]]^2)
+    }
+    
+    #compute adjusted SSR of fits
+    SSRnorm <- c()
+    aux_fits <- stats_fit[stats_fit$bc==bc,]
+    for(i in 1:length(RR)){
+      aux_nrow <- aux_fits[i,'rows']
+      aux_ncol <- aux_fits[i,'cols']
+      SSRnorm[i] <- SSR[i] * (aux_nrow*aux_ncol)/(aux_nrow+aux_ncol)
+    }
+    aux_SSRnorm_min <- which.min(SSRnorm)
+    aux_SSR_min <- which.min(SSR)
+    
+    aux_loss <- aux_fits[aux_fits$fit==aux_SSRnorm_min,'loss']
+    aux_lambda <- aux_fits[aux_fits$fit==aux_SSRnorm_min,'lambda']
+    
+    aux_A_nz <- which(AA[[aux_SSRnorm_min]]!=0)
+    aux_B_nz <- which(BB[[aux_SSRnorm_min]]!=0)
+    biclusters[[bc]][["rows"]] <- aux_A_nz
+    biclusters[[bc]][["cols"]] <- aux_B_nz
+    biclusters[[bc]][["A"]] <- AA[[aux_SSRnorm_min]]
+    biclusters[[bc]][["B"]] <- BB[[aux_SSRnorm_min]]
+    biclusters[[bc]][["C"]] <- as.data.frame(CC[[aux_SSRnorm_min]])
+    biclusters[[bc]][["C_hat"]] <- as.data.frame(CHATT[[aux_SSRnorm_min]])
+    biclusters[[bc]][["R"]] <- as.data.frame(RR[[aux_SSRnorm_min]])
+    
+    for(r in aux_A_nz){
+      for(c in aux_B_nz){
+        X[r,c] <- smallnum^2
+      }
+    }
+  
+    time_bc_end <- Sys.time()
+    aux_nrow <- length(aux_A_nz)
+    aux_ncol <- length(aux_B_nz)
+    time_bc <- round(as.numeric(difftime(time_bc_end, time_bc_start, units = "secs")),4)
+        print(paste0("    Bicluster ",bc," (",aux_nrow," rows, ",aux_ncol,
+                     " columns) found in ",time_bc,"s"))
+    
+    aux_stats_bc_row <-c(bc,aux_nrow,aux_ncol,min(SSRnorm),aux_loss,aux_lambda,time_bc,aux_sparsity,time_init)
+    aux_colnames <- c('bc','rows','cols','SSRnorm','loss','lambda','time_s',
+                      'X_sparsity','time_init')
+        
+    stats_bc <- rbind(stats_bc,aux_stats_bc_row)
+    colnames(stats_bc) <- aux_colnames    
+  }
+
+  
+}
+
+if(flag.stopall){
+  biclusters[[bc]] <- NULL
+  bc <- bc-1
+}
+
+time_loop_end <- Sys.time()
+
+      n_biclust <- length(biclusters)
+      if(n_biclust>0){
+        print('analyzing found biclusters...')
+  
+        #get the rows and columns in the biclusters
+        bc_allrows <- c()
+        bc_allcols <- c()
+
+        for(i in 1:n_biclust){
+          bc_rows <- biclusters[[i]][["rows"]]
+          bc_cols <- biclusters[[i]][["cols"]]
+          bc_allrows <- append(bc_allrows,bc_rows)
+          bc_allcols <- append(bc_allcols,bc_cols)
+          bc_allrows <- unique(bc_allrows)
+          bc_allcols <- unique(bc_allcols)
+        }
+
+        n_rows <- length(unique(bc_allrows))
+        n_cols <- length(unique(bc_allcols))
+      }
+
+
+time_loop <- round(as.numeric(difftime(time_loop_end, time_loop_start, units = "secs")),4)
+
+time_string <- format_time(time_loop)
+
+print(paste('found',n_rows,'rows and',n_cols,'columns across',n_biclust,'biclusters in', time_string))
+
+print(paste0(if(I-n_rows>0){paste(I-n_rows,' rows')}else{paste('')},
+            if(J-n_cols>0){paste(J-n_cols,' columns')}else{paste('')},
+            ' are not part of any biclusters'))
+
+
+rm(aux_A_nz,aux_B_nz,aux_colnames,aux_cols,aux_rows,aux_ncol,aux_nrow,aux_sparsity,aux_SSR_min,aux_SSRnorm_min,aux_stats_bc_row,aux_stats_fit_row,aux_j,aux_loss,aux_lambda,aux_fits)
+rm(bc,c,deltaLAMB,fitcount,i,j,r,rankdef,SSR,SSRnorm,term_A,term_B,term_norm)
+rm(time_bc,time_fit,time_init,time_loop)
+rm(time_bc_start,time_fit_start,time_init_start,time_loop_start)
+rm(time_bc_end,time_fit_end,time_init_end,time_loop_end)
+rm(A,A_old,AA,B,B_old,BB,biclusters_sub,CC,CHATT,nmf_X,RR,SMR_out,XHATT)
+```
+
+## Performance Plots
+
+Overview of the different fits tried for each bicluster. Useful for fine-tuning the starting lambda and the lambda increase across multiple runs.
+
+-   **Samples and features considered by lambda:** shows how the lambda value impacts the sparsity of the latent factors. Expected output: lower lambdas tend to become "inactive" penalties, producing denser factors leading to more samples or features being considered.
+
+-   **Computed loss:** sum of three terms: Frobenius norm, A term, B term.
+
+$$
+\| \mathbf{X}-\mathbf{AB}^\mathit{T}\|_F^2+\lambda\sum\limits_{i,k}|\mathbf{A}_{\mathit{ik}}|+\lambda\sum\limits_{j,k}|\mathbf{B}_{\mathit{jk}}|
+$$
+
+-   We plot the behavior of each term in the sum as a function of the active lambda penalty (Frobenius norm term, A term, B term).
+
+-   Correlations:
+
+```         
+-   **A and B term:** using a single $\lambda$ , we expect to see a near-perfect correspondence between both. This plot becomes useful when extending this method to consider different L1-penalties for the rows ($\lambda_A$) and the columns ($\lambda_B$).
+
+-   **Loss and Frobenius norm:** we expect to see a high correlation between both, as terms A and B represent a smaller proportion of the loss.
+```
+
+-   **Histograms:** relative contribution of terms A and B to the loss for each fit.
+
+```{r plot_performance}
+plot(stats_fit[,"fit"],stats_fit[,"rows"],main="samples considered by lambda",
+     xlab="lambda",ylab="samples")
+plot(stats_fit[,"fit"],stats_fit[,"cols"],main="features considered by lambda",
+     xlab="lambda",ylab="features")
+
+plot(stats_fit[,"lambda"],stats_fit[,"loss"],main="computed loss by lambda",
+     xlab="lambda",ylab="loss")
+plot(stats_fit[,"lambda"],stats_fit[,"norm_t"],main="frobenius norm term by lambda",
+     xlab="lambda",ylab="norm")
+plot(stats_fit[,"lambda"],stats_fit[,"A_t"],main="A term by lambda",
+     xlab="lambda",ylab="A")
+plot(stats_fit[,"lambda"],stats_fit[,"B_t"],main="B term by lambda",
+     xlab="lambda",ylab="B")
+
+plot(stats_fit[,"A_t"],stats_fit[,"B_t"],main="correlation between A and B terms - all fits",
+     xlab="A",ylab="B")
+plot(stats_fit[,"norm_t"],stats_fit[,"loss"],main="correlation between loss and Frobenius norm - all fits",
+     xlab="Frobenius norm",ylab="loss")
+
+hist(stats_fit[,'A_t']/stats_fit[,'loss'],xlab='A term / loss',ylab='fits',main='relative contribution of the A term to the loss')
+hist(stats_fit[,'B_t']/stats_fit[,'loss'],xlab='B term / loss',ylab='fits',main='relative contribution of the B term to the loss')
+```
+
+## Cluster Analysis
+
+### Descriptive statistics
+
+```         
+```
+
+Histograms:
+
+-   Number of rows and columns per cluster.
+
+-   Cluster dimensions (rows \* columns).
+
+-   Cluster sparsity: proportion of zeros per cluster.
+
+```{r bc_stats}
+hist(stats_bc$rows,breaks=n_biclust,main="Number of rows per cluster")
+hist(stats_bc$cols,breaks=n_biclust,main="Number of columns per cluster")
+
+stats_bc$dim <- stats_bc$rows*stats_bc$cols
+hist(stats_bc$dim,breaks=n_biclust,main="Cluster dimensions (row*col)")
+
+stats_bc$sparsity <- 0
+for(bcc in 1:length(biclusters)){
+  stats_bc[bcc,'sparsity'] <- length(which(biclusters[[bcc]][["C"]]==0))/stats_bc[bcc,'dim']
+}
+hist(stats_bc$sparsity,breaks=n_biclust,main="Cluster sparsity")
+
+```
+
+```{r bc_table}
+stats_bc_table <- stats_bc[,c('bc','rows','cols')]
+stats_bc_table$density <- 1 - stats_bc$sparsity
+
+stats_bc_table
+```
+
+Correlations:
+
+-   Between rows and columns: no correlation expected.
+
+-   Sparsity and rows: minimal or no correlation expected.
+
+-   Sparsity and columns: moderate correlation expected. More features in a cluster may lead to having most of them not containing reads across the corresponding subset of rows.
+
+-   Sparsity and dimension: moderate or low correlation expected. Larger biclusters may contain fewer elements with reads.
+
+```{r bc_plots}
+#columns ~ rows
+aux_lm <- lm(stats_bc$cols ~ stats_bc$rows)
+aux_lm_summ <- summary(aux_lm)
+aux_rsq <- aux_lm_summ$r.squared
+plot(stats_bc$rows,stats_bc$cols,xlab='rows',ylab='columns',
+     main=paste('columns ~ rows\nR-squared =',round(aux_rsq,2)))
+abline(aux_lm, col = "red", lwd = 2)
+
+
+#sparsity ~ rows
+aux_lm <- lm(stats_bc$sparsity ~ stats_bc$rows)
+aux_lm_summ <- summary(aux_lm)
+aux_rsq <- aux_lm_summ$r.squared
+plot(stats_bc$rows,stats_bc$sparsity,xlab='rows',ylab='sparsity',
+     main=paste('sparsity ~ rows\nR-squared =',round(aux_rsq,2)))
+abline(aux_lm, col = "red", lwd = 2)
+
+#sparsity ~ cols
+aux_lm <- lm(stats_bc$sparsity ~ stats_bc$cols)
+aux_lm_summ <- summary(aux_lm)
+aux_rsq <- aux_lm_summ$r.squared
+plot(stats_bc$cols,stats_bc$sparsity,xlab='columns',ylab='sparsity',
+     main=paste('sparsity ~ columns\nR-squared =',round(aux_rsq,2)))
+abline(aux_lm, col = "red", lwd = 2)
+
+#sparsity ~ dimension
+aux_lm <- lm(stats_bc$sparsity ~ stats_bc$dim)
+aux_lm_summ <- summary(aux_lm)
+aux_rsq <- aux_lm_summ$r.squared
+plot(stats_bc$dim,stats_bc$sparsity,xlab='dimension',ylab='sparsity',
+     main=paste('sparsity ~ dimension\nR-squared =',round(aux_rsq,2)))
+abline(aux_lm, col = "red", lwd = 2)
+
+```
+
+```         
+```
+
+### Compute inter-cluster Jaccard index
+
+For all found clusters, compute a pairwise Jaccard index:
+
+-   At the row level: IoU~rows~
+
+-   At the column level: IoU~cols~
+
+-   Average of both matrices
+
+Output: symmetric matrices
+
+```{r bc_iou}
+
+# housekeeping: delete IoU matrices for reruns
+biclusters[['iou_rows']] <- NULL
+biclusters[['iou_cols']] <- NULL
+biclusters[['iou_avg']] <- NULL
+biclusters[['iou_rows_max']] <- NULL
+biclusters[['iou_cols_max']] <- NULL
+biclusters[['iou_avg_max']] <- NULL
+
+# compute IoU matrices for rows and for columns
+n_biclust <- length(biclusters)
+if(n_biclust>1){
+  print(paste0('computing Jaccard index between ',n_biclust,' biclusters...'))
+  aux_intersect_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_intersect_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  
+  for(bc in 1:n_biclust){
+    for(bcc in 1:n_biclust){
+      aux_intersect_rows[bc,bcc] <- length(intersect(biclusters[[bc]][["rows"]],
+                                                     biclusters[[bcc]][["rows"]]))
+      aux_intersect_cols[bc,bcc] <- length(intersect(biclusters[[bc]][["cols"]],
+                                                     biclusters[[bcc]][["cols"]]))
+      aux_union_rows[bc,bcc] <- length(union(biclusters[[bc]][["rows"]],
+                                             biclusters[[bcc]][["rows"]]))
+      aux_union_cols[bc,bcc] <- length(union(biclusters[[bc]][["cols"]],
+                                             biclusters[[bcc]][["cols"]]))
+      aux_iou_rows[bc,bcc] <- round(aux_intersect_rows[bc,bcc]/aux_union_rows[bc,bcc],4)
+      aux_iou_cols[bc,bcc] <- round(aux_intersect_cols[bc,bcc]/aux_union_cols[bc,bcc],4)
+    }
+
+    # store computed IoU matrices
+    biclusters[["iou_rows"]] <- aux_iou_rows
+    biclusters[["iou_cols"]] <- aux_iou_cols
+    
+    # get highest IoU: jaccard index and bicluster indices
+    biclusters[["iou_rows_max"]] <- off_diagonal_max(aux_iou_rows)
+    biclusters[["iou_cols_max"]] <- off_diagonal_max(aux_iou_cols)
+    
+  }
+}
+
+# average of both IoU matrices
+aux_iou_avg <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+for(i in 1:n_biclust){
+  for(j in 1:n_biclust){
+    aux_iou_avg[i,j] <- (biclusters[['iou_rows']][i,j]+biclusters[['iou_cols']][i,j])/2
+  }
+}
+
+# store computed average IoU matrix
+biclusters[['iou_avg']] <- aux_iou_avg
+biclusters[["iou_avg_max"]] <- off_diagonal_max(aux_iou_avg)
+
+aux_pos_rows <- unlist(biclusters[["iou_rows_max"]][["positions"]])
+aux_pos_cols <- unlist(biclusters[["iou_cols_max"]][["positions"]])
+aux_pos_avg <- unlist(biclusters[["iou_avg_max"]][["positions"]])
+
+print(paste0('highest row overlap: IoU=', biclusters[["iou_rows_max"]][["value"]]))
+bc_i <- aux_pos_rows[1]
+bc_j <- aux_pos_rows[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_rows[1]]][['rows']],biclusters[[aux_pos_rows[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_rows[1]]][['cols']],biclusters[[aux_pos_rows[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_rows, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest column overlap: IoU=', biclusters[["iou_cols_max"]][["value"]]))
+bc_i <- aux_pos_cols[1]
+bc_j <- aux_pos_cols[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_cols[1]]][['rows']],biclusters[[aux_pos_cols[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_cols[1]]][['cols']],biclusters[[aux_pos_cols[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_cols, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest averaged overlap: IoU=', biclusters[["iou_avg_max"]][["value"]]))
+bc_i <- aux_pos_avg[1]
+bc_j <- aux_pos_avg[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_avg[1]]][['rows']],biclusters[[aux_pos_avg[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_avg[1]]][['cols']],biclusters[[aux_pos_avg[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_avg, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+rm(aux_pos_rows,aux_pos_cols,aux_pos_avg,bc_i,bc_j,aux_intersect_rows,aux_intersect_cols,aux_union_rows,aux_union_cols,aux_iou_rows,aux_iou_cols,aux_iou_avg,bc,bcc)
+rm(i,j)
+```
+
+#### Visualize IoU matrices as heatmaps
+
+```{r heatmaps_iou}
+
+heatmap(biclusters[["iou_rows"]], Rowv=NA, Colv=NA, scale="none", main='IoU: rows')
+heatmap(biclusters[["iou_cols"]], Rowv=NA, Colv=NA, scale="none", main='IoU: columns')
+heatmap(biclusters[["iou_avg"]], Rowv=NA, Colv=NA, scale="none", main='averaged IoU: rows&columns')
+
+```
+
+### Dendrograms: visualize merging candidates
+
+Converting the Jaccard indices into distances, display dendrograms shown possible merging candidates. Set a distance as possible merging threshold and draw it as a horizontal line to evaluate. We suggest using **average linkage** and a distance of 0.33 (IoU=0.66). Ultimately, the choice for linkage method and distance threshold is up to the researcher and findings in the particular data set and the desired "cut point" after viewing the dendrograms.
+
+```{r dendro}
+
+#Choose linkage method between: average, median, centroid, single, complete
+aux_linkage <- 'average'
+
+#set possible merging threshold
+aux_thresh <- 0.7
+
+
+# Jaccard index to distance (1 - Jaccard index)
+distance_rows_m <- 1 - biclusters[['iou_rows']]
+distance_cols_m <- 1 - biclusters[['iou_cols']]
+distance_avg_m <- 1 - biclusters[['iou_avg']]
+
+# hierarchical clustering
+# convert distance matrix to "dist" vector
+distance_rows_v <- as.dist(distance_rows_m)
+distance_cols_v <- as.dist(distance_cols_m)
+distance_avg_v <- as.dist(distance_avg_m)
+
+# use average linkage
+hc_rows <- hclust(distance_rows_v, method=aux_linkage)
+hc_cols <- hclust(distance_cols_v, method=aux_linkage)
+hc_avg <- hclust(distance_avg_v, method=aux_linkage)
+
+# plot dendrograms
+plot(hc_rows, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: row-wise similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Jrows(BCm,BCn)",sub='')
+#abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_cols, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: column-wise similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Jcols(BCm,BCn)",sub='')
+#abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_avg, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: averaged row-column similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Javerage(BCm,BCn)",sub='')
+#abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+```
+
+Looking at the three plots, we can make a choice between merging at a distance threshold on the rows, columns or the average, as well as adjust the threshold to a desired level.
+
+```{r}
+rm(distance_rows_m,distance_rows_v,distance_cols_m,distance_cols_v,distance_avg_m,distance_avg_v)
+```
+
+### Visualize all clusters in a matrix
+
+#### Order rows and columns by bicluster
+
+Get (reverse) order from the post-merge hierarchical clustering of biclusters
+
+```{r X_bc_order}
+#| echo: false
+#| message: false
+#| warning: false
+
+#choose normal or reverse order
+aux_bc_order <- rev(hc_avg[["order"]])
+#aux_bc_order <- hc_avg[["order"]]
+
+```
+
+Compute union of rows and columns of biclusters following the chosen order
+
+```{r X_bc_rowscols}
+#| echo: false
+#| message: false
+#| warning: false
+
+joinrows <- c()
+joincols <- c()
+
+for(bcc in aux_bc_order){
+  aux_pos <- which(aux_bc_order==bcc)
+  if(aux_pos<length(aux_bc_order)){
+    aux_x <- aux_bc_order[aux_pos]
+    aux_y <- aux_bc_order[aux_pos+1]
+    if(aux_pos==1){
+      #print(paste('comparing',aux_x,aux_y))
+      
+      #union without reordering. intersection first.
+      aux_x_rows <- biclusters[[aux_x]][['rows']]
+      aux_x_cols <- biclusters[[aux_x]][['cols']]
+      
+    }else{
+      #print(paste('comparing previous merge with',aux_y))
+      aux_x_rows <- aux_union_rows
+      aux_x_cols <- aux_union_cols
+      }
+    aux_y_rows <- biclusters[[aux_y]][['rows']]
+    aux_y_cols <- biclusters[[aux_y]][['cols']]
+    
+    aux_intersect_rows <- intersect(aux_x_rows,aux_y_rows)
+    aux_setdiff_rows <- setdiff(union(aux_x_rows,aux_y_rows),aux_intersect_rows)
+    aux_union_rows <- c(aux_intersect_rows,aux_setdiff_rows)
+
+        aux_intersect_cols <- intersect(aux_x_cols,aux_y_cols)
+    aux_setdiff_cols <- setdiff(union(aux_x_cols,aux_y_cols),aux_intersect_cols)
+    aux_union_cols <- c(aux_intersect_cols,aux_setdiff_cols)
+
+  }
+}
+
+
+
+rm(aux_pos,aux_x,aux_y,aux_x_rows,aux_x_cols,aux_y_rows,aux_y_cols,aux_intersect_rows,aux_intersect_cols,aux_setdiff_rows,aux_setdiff_cols)
+```
+
+#### Color-code elements by bicluster membership
+
+Assigns the bicluster number to each element, assigns n_biclust + 1 to overlapping elements. Any unassigned element is set to zero.
+
+```{r X_color_assign}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xcolor <- X
+Xcolor[,] <- NA
+for(bcc in aux_bc_order){
+  aux_rows <- biclusters[[bcc]][['rows']]
+  aux_cols <- biclusters[[bcc]][['cols']]
+  for(i in aux_rows){
+    for(j in aux_cols){
+      if(is.na(Xcolor[i,j])){ #if the element is empty, assign a cluster number as label
+        Xcolor[i,j]<-bcc
+      }else{ #if it already contains a value (overlap), assign a very large number as label
+        Xcolor[i,j]<-n_biclust+1
+      }
+      
+    }
+  }
+}
+
+Xcolor[is.na(Xcolor)] <- 0
+```
+
+#### Biclusters in matrix: clustered rows and columns only
+
+Rows and columns ordered and grouped by cluster membership. Creates a rainbow pallette using the number of biclusters. Unassigned elements are black, overlapping elements are white.
+
+```{r X_bc_sub}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_colors <- c('#000000',rainbow(n_biclust),'#ffffff')
+
+heatmap(Xcolor[aux_union_rows,aux_union_cols], Rowv=NA, Colv=NA, scale="none", main='Clusters in a subset of X',col = aux_colors,cexRow=0.5,cexCol=0.1)
+
+colorLegend <- aux_colors
+legend("topright",legend = c('none',1:n_biclust,'overlap'),
+       fill=colorLegend, title = "bicluster")
+
+
+heatmap(Xsqrt[aux_union_rows,aux_union_cols], Rowv=NA, Colv=NA, scale="none", main='Binarized X (clustered columns)',cexRow=0.5,cexCol=0.1)
+
+```
+
+#### Biclusters in X
+
+Rows and columns ordered and grouped by cluster membership, unclustered columns on the left, unclustered rows on the bottom (if any)
+
+```{r X_bc}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_union_rows_X <- c(aux_union_rows,setdiff(1:I,aux_union_rows))
+aux_union_cols_X <- c(aux_union_cols,setdiff(1:J,aux_union_cols))
+
+heatmap(Xcolor[aux_union_rows_X,aux_union_cols_X], Rowv=NA, Colv=NA, scale="none", main='Clusters in X',col = aux_colors,cexRow=0.5,cexCol=0.1)
+
+colorLegend <- aux_colors
+legend("topright",legend = c('none',1:n_biclust,'overlap'),
+       fill=colorLegend, title = "bicluster")
+```
+
+### Visualize individual clusters
+
+```{r bc_all_view}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+  
+  if(stats_bc[stats_bc$bc==bcc,'rows']<=20){aux_cexrow<-1}else{aux_cexrow<-0.5}
+  if(stats_bc[stats_bc$bc==bcc,'cols']<=40){aux_cexcol<-1}else{
+    if(stats_bc[stats_bc$bc==bcc,'cols']<=100){
+      aux_cexcol<-0.25
+      }else{
+        aux_cexcol<-0.1
+      }
+    }
+  
+  aux_matrix <- as.matrix(sqrt(sqrt(biclusters[[bcc]][['C']])))
+  heatmap(aux_matrix, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',bcc),cexRow=aux_cexrow,cexCol=aux_cexcol)
+}
+
+
+```
+
+### Biological relevance
+
+Identify by index: study groups and dysbiotic status in the samples, class and family of taxa.
+
+Sample subsets:
+
+-   3 study groups
+
+-   2 dysbiotic status
+
+Taxonomy:
+
+-   10 phyla
+
+-   17 classes
+
+-   48 families
+
+```{r bio_samples}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+    aux_meta <- X_meta[biclusters[[bcc]][["rows"]],]
+    biclusters[[bcc]][['diagnosis']] <- as.matrix(table(aux_meta$diagnosis))
+    biclusters[[bcc]][['dysbiotic']] <- as.matrix(table(aux_meta$dysbiotic))
+}
+
+ind_meta_diag <- vector('list')
+for(d in unique(X_meta$diagnosis)){
+  ind_meta_diag[[d]] <- which(X_meta$diagnosis==d)
+}
+
+X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
+ind_meta_dysb <- vector('list')
+for(d in unique(X_meta$dysbiotic)){
+  ind_meta_dysb[[d]] <- which(X_meta$dysbiotic==d)
+}
+```
+
+```{r bio_taxa}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+    aux_taxo <- X_taxo[biclusters[[bcc]][["cols"]],]
+    biclusters[[bcc]][['phylum']] <- as.matrix(table(aux_taxo$phylum))
+    biclusters[[bcc]][['class']] <- as.matrix(table(aux_taxo$class))
+    biclusters[[bcc]][['family']] <- as.matrix(table(aux_taxo$family))
+}
+
+ind_taxo_phylum <- vector('list')
+for(t in unique(X_taxo$phylum)){
+  ind_taxo_phylum[[t]] <- which(X_taxo$phylum==t)
+}
+ind_taxo_class <- vector('list')
+for(t in unique(X_taxo$class)){
+  ind_taxo_class[[t]] <- which(X_taxo$class==t)
+}
+ind_taxo_family <- vector('list')
+for(t in unique(X_taxo$family)){
+  ind_taxo_family[[t]] <- which(X_taxo$family==t)
+}
+```
+
+For each bicluster, list the distribution of diagnosis and dysbiosis.
+
+As counts:
+
+```{r bc_diag_dysb}
+#| echo: false
+#| message: false
+#| warning: false
+
+
+for(bcc in 1:n_biclust){
+  print(paste0('BC',bcc))
+  print('diagnosis:')
+  for(d in unique(X_meta$diagnosis)){
+    aux_intersect<- length(intersect(biclusters[[bcc]][['rows']],ind_meta_diag[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('dysbiotic:')
+  for(d in unique(X_meta$dysbiotic)){
+    aux_intersect <- length(intersect(biclusters[[bcc]][['rows']],ind_meta_dysb[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+}
+```
+
+Identifying individual samples:
+
+```{r bc_diag_dysb_table}
+for(bcc in 1:n_biclust){
+  aux_rows <- biclusters[[bcc]][['rows']]
+  print(X_meta[aux_rows,c('diagnosis','dysbiotic')])
+}
+```
+
+For each bicluster, list the distribution by phylum, class, family.
+
+```{r bc_taxo}
+for(bcc in 1:n_biclust){
+  print(paste0('BC',bcc))
+  print('phylum:')
+  for(d in unique(X_taxo$phylum)){
+    aux_intersect<- length(intersect(biclusters[[bcc]][['cols']],ind_taxo_phylum[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+  print('class:')
+  for(d in unique(X_taxo$class)){
+    aux_intersect<- length(intersect(biclusters[[bcc]][['cols']],ind_taxo_class[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+  print('family:')
+  for(d in unique(X_taxo$family)){
+    aux_intersect<- length(intersect(biclusters[[bcc]][['cols']],ind_taxo_family[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('----------------------------------------')
+}
+```
+
+### 
+
+### Inspect a single cluster
+
+Create a temporary object with the bicluster, selected by number.
+
+**NOTE: the C matrices are sourced from Xsqrt. Abundances shown are sqrt-transformed.**
+
+```{r bc_singgle}
+
+BC <- 3
+aux_bc <- as.matrix(biclusters[[BC]][['C']])
+
+```
+
+```{r hc_inspect_meta}
+#| echo: false
+#| message: false
+#| warning: false
+
+#input a study group and a dysbiotic status of interest
+aux_diag <- 'HC'
+aux_dysb <- 'F'
+
+#number of results for median taxonomic abundance
+aux_n <- 10
+
+#convert TRUE and FALSE to T and F
+X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
+
+#get row names of all samples and of nonzero taxa in the cluster
+aux_samples <- rownames(aux_bc)
+aux_taxa <- colnames(aux_bc)
+
+#get the metadata and taxonomy of the clustered rows and the nonzero taxa
+X_meta_bc <- X_meta[aux_samples,]
+X_taxo_bc <- X_taxo[aux_taxa,]
+
+#visualize the group distribution of the selection of samples
+as.data.frame(table(X_meta_bc$diagnosis)) #samples by diagnosis
+as.data.frame(table(X_meta_bc$dysbiotic)) #samples by dysbiotic status
+as.data.frame(table(X_taxo_bc$class)) #taxa by class
+as.data.frame(table(X_taxo_bc$family)) #taxa by family
+
+#select a diagnosis and get a submatrix from the bicluster
+X_meta_bc_diag <- X_meta_bc[X_meta_bc$diagnosis==aux_diag,]
+aux_bc_diag <- aux_bc[rownames(X_meta_bc_diag),]
+
+#select by dysbiotic status and get a submatrix from the bicluster
+X_meta_bc_dysb <- X_meta_bc[X_meta_bc$dysbiotic==aux_dysb,]
+aux_bc_dysb <- aux_bc[rownames(X_meta_bc_dysb),]
+
+#visualize the selections to find patterns
+heatmap(aux_bc_diag, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluster',BC,' (',aux_diag,')'),cexRow=1,cexCol=0.25)
+
+heatmap(aux_bc_dysb, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluster',BC, '(',
+                                                                ifelse(aux_dysb=='T','','non-'),'dysbiotic)'),cexRow=1,cexCol=0.25)
+
+#keep only nonzero taxa
+aux_bc_diag <- aux_bc_diag[,aux_taxa]
+aux_bc_dysb <- aux_bc_dysb[,aux_taxa]
+
+#get the median abundance of taxa by diagnosis and by dysbiotic status
+#by diagnostic
+aux_bc_diag_colsum_median <- apply(aux_bc_diag,2,median)
+print(paste('Top ',aux_n,' median abundance taxa in',paste0('BC',BC),aux_diag,':'))
+head(sort(aux_bc_diag_colsum_median[aux_bc_diag_colsum_median>0], decreasing = TRUE),n=aux_n)
+print('----------------------------------------')
+print(paste('Bottom ',aux_n,' median abundance taxa in',paste0('BC',BC),aux_diag,':'))
+head(sort(aux_bc_diag_colsum_median[aux_bc_diag_colsum_median>0], decreasing = FALSE),n=aux_n)
+
+print('========================================')
+#by dysbiosis
+aux_bc_dysb_colsum_median <- apply(aux_bc_dysb,2,median)
+print(paste0('Top ',aux_n,' median abundance taxa in ',paste0('BC',BC),ifelse(aux_dysb=='T','','non-'),' dysbiotic:'))
+head(sort(aux_bc_dysb_colsum_median[aux_bc_dysb_colsum_median>0], decreasing = TRUE),n=aux_n)
+print('----------------------------------------')
+print(paste0('Bottom ',aux_n,' median abundance taxa in ',paste0('BC',BC),ifelse(aux_dysb=='T','','non-'),'d ysbiotic:'))
+head(sort(aux_bc_dysb_colsum_median[aux_bc_dysb_colsum_median>0], decreasing = FALSE),n=aux_n)
+
+```
+
+### 

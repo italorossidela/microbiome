@@ -1,0 +1,601 @@
+---
+title: "Microbiome Data Analysis Using Biclustering Approaches - Supplementary Material: Bibit"
+author: "Italo Rossi del Aguila"
+format: pdf
+editor: visual
+---
+
+```{r loadpk}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+```
+
+## Data Set
+
+### Load data
+
+During import, transpose to place samples on the rows and taxa on the columns.
+
+```{r data_load, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+X <- read.delim("data/microbiome_dataSet1.tsv",row.names=1)
+X <- t(as.matrix(X))
+```
+
+### Basic Filtering
+
+Find any null/NA values and set them to 0. Eliminate all-zero rows and columns. Check for any negative values.
+
+```{r data_trns, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#NAs to zeros
+X[is.na(X)] <- 0
+
+#remove all-zero samples
+aux_allzero <- which(rowSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[-aux_allzero,]
+}
+
+#remove all-zero taxa
+aux_allzero <- which(colSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[,-aux_allzero]
+}
+
+rm(aux_allzero)
+
+if(any(X<0)){
+  print("X has negative values. DO NOT CONTINUE.")
+}
+
+I <- dim(X)[1]; J <- dim(X)[2]
+```
+
+### Filtering rare taxa
+
+Find and remove rare taxa: OTUs with only one count across all samples
+
+```{r EDA_filter}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_rare <- which(colSums(X)==1)
+X <- X[,-aux_rare]
+
+#update dimension variables I and J
+I <- dim(X)[1]; J <- dim(X)[2]
+
+rm(aux_rare)
+```
+
+### Preprocessing
+
+#### Binary data matrix
+
+Binarization of the original input matrix X: 1 = count present at Xij, 0 otherwise.
+
+```{r pre_bin}
+
+Xbin <- X
+Xbin[Xbin>0] <- 1
+```
+
+# Bibit - Multiple Runs
+
+This document is designed to measure the results and performance of the Bibit algorithm across multiple runs with varying parameters (bwl, mnr. mnc).
+
+## Global objects
+
+```{r pre_objects}
+
+#list with all biclusters
+biclusters <- vector("list")
+
+runs_bc <- list()
+
+#list for each bicluster, with 7 objects each
+rows <- list()
+cols <- list()
+pattern <- ''
+
+biclusters_sub <- list('rows'=rows,'cols'=cols,'pattern'=pattern)
+
+stats_run <- matrix(nrow=0,ncol=9)
+aux_colnames <- c('bwl','mnr','mnc','biclusters','rows_all','cols_all','time_enc','time_sch','time')
+colnames(stats_run) <- aux_colnames
+
+stats_bc <- matrix(nrow=0,ncol=7)
+aux_colnames <- c('run','bwl','mnr','mnc','bc','rows','cols')
+colnames(stats_bc) <- aux_colnames
+
+stats_run_summ <- matrix(nrow=0,ncol=12)
+aux_colnames <- c('rows.min','rows.q1','rows.median','rows.mean','rows.q3','rows.max','cols.min','cols.q1','cols.median','cols.mean','cols.q3','cols.max')
+colnames(stats_run_summ) <- aux_colnames
+
+rm(aux_colnames)
+```
+
+## Functions
+
+### Formatting time string
+
+Takes seconds as an input, returns minutes if \>= 60 seconds, hours if \>= 3600 seconds.
+
+```{r func_format}
+
+format_time <- function(seconds) {
+  if (seconds < 60) {
+    return(paste(round(seconds, 2), "seconds"))
+  } else if (seconds < 3600) {
+    minutes <- seconds / 60
+    return(paste(round(minutes, 2), "minutes"))
+  } else {
+    hours <- seconds / 3600
+    return(paste(round(hours, 2), "hours"))
+  }
+}
+
+```
+
+### Encoding
+
+Phase 1 of Bibit. Takes a binarized matrix as input and returns a matrix encoded into bit words for faster computation when comparing row contents.
+
+```{r func_encoding}
+bb_encoding <- function(Xbin,I,J,bwl){
+  time_enc_start <- Sys.time()
+
+    #empty matrix to store the bitword-encoded matrix
+  Xbw <- matrix(, nrow = 0, ncol = ceiling(J/bwl))
+  
+  for(i in 1:I){
+    m <- 1
+    aux_row <- c()
+    for(j in seq(1,J,by=bwl)){
+      aux_bitword <- ''
+      for(k in 0:(bwl-1)){
+        if(j+k <= J){
+          aux_bitword <- paste0(aux_bitword,Xbin[i,j+k])
+        }
+      }
+      aux_row[m] <- strtoi(aux_bitword, base=2)
+      if(m<ceiling(J/bwl)){
+        m <- m+1
+      }
+    }
+    Xbw <- rbind(Xbw,aux_row)
+  }
+  
+  time_enc_end <- Sys.time()
+  time_enc <- round(as.numeric(difftime(time_enc_end, time_enc_start, units = "secs")),4)
+  
+  out_encoding <- vector("list",2)
+  out_encoding[[1]] <- Xbw
+  out_encoding[[2]] <- time_enc
+
+  return(out_encoding)
+}
+
+```
+
+### Searching
+
+Phase 2 of Bibit. Takes the bitword-encoded matrix from the encoding phase, mnr and mnc. For every pair of rows (r~m~,r~n~), a pattern $\rho_{mn}$ is formed by performing a bitwise AND operation. If the number of 1s in $\rho_{mn}$ is \>= mnc, a bitwise AND operation is performed on each of the remainder rows of the encoded matrix. If the resulting pattern is equal to the original pattern, the row gets added to a temporary bicluster. After checking every remainder row, if the total number of rows in the temporary bicluster \>= mnr, the temporary bicluster is added to the global list of biclusters. The searching phase finishes when the pattern has been compared with all remainder rows.
+
+```{r func_searching}
+bb_searching <- function(Xbw,mnr,mnc){
+
+  time_sch_start <- Sys.time()
+
+#empty object to store patterns
+found_patterns <- c()    
+
+# Generate all row pairs
+aux_rowpairs <- combn(1:I, 2)
+
+# ALGORITHM 1
+# 1. for every rows pair (r_m,r_n) do
+for(i in 1:ncol(aux_rowpairs)){
+  m <- aux_rowpairs[1,i]
+  n <- aux_rowpairs[2,i]
+  #print(paste0('comparing r',m,' and r',n))
+  
+#2. rho_mn = r_m ^ r_n  
+  rho_mn <- bitwAnd(Xbw[m,],Xbw[n,])
+
+  # 2.1 get number of 1's in rho_mn:
+  # 2.1.1 convert integer bitwords to binary strings of length bwl
+  bw2bin <- sapply(rho_mn, function(x) {
+    binary <- as.integer(intToBits(x))  #bitword: integer to binary (length 32)
+    binary <- rev(binary[1:bwl])       #select the first bwl bits and reverse
+    paste(binary, collapse = "")       #single bwl-bit long string
+  })
+  
+  # 2.1.2 from binary strings to J-length pattern string
+  n_bw <- length(bw2bin) #number of bitwords
+  if(n_bw*bwl!=J){ #if number of bitwords*bwl != J
+    nbits_tail <- bwl-(n_bw*bwl-J) #get number of necessary encoding bits at last bitword
+    bw2bin[n_bw] <- str_sub(bw2bin[n_bw],-nbits_tail) #trim last bitword to encoding bits
+  }
+  pattern <- paste(bw2bin,collapse='') #binarized bitwords to J-length binary string
+
+  # 2.2 (FOR LINE 3) get number of 1s from J-length pattern string
+  pattern_1s <- str_count(pattern,'1')
+
+  # 2.3 (FOR LINE 3) check if the pattern is new
+  if (!(pattern %in% found_patterns)){
+      flag.new <- 1
+      found_patterns <- c(found_patterns, pattern)
+  }else{
+    flag.new <- 0
+  }
+#3. if pattern is new and number of 1s in pattern >=mnc:
+  #print(paste0('rho_',m,'_',n,': flag.new=',flag.new,' cols=',pattern_1s))
+  if(flag.new & pattern_1s>=mnc){
+#4. create and populate  Bic_mn bicluster
+    biclusters_mn <- biclusters_sub #empty object to populate
+    biclusters_mn[['rows']] <- c(m,n) #store rows M
+    
+    aux_chars <- strsplit(pattern, "")[[1]] #split pattern as vector to find 1s
+    biclusters_mn[['cols']] <- which(aux_chars=='1') #store 1s as columns N
+    
+    biclusters_mn[['pattern']] <- rho_mn #store bitword pattern
+
+    
+    
+    
+   
+}#5. for every remainder row q in Q
+      Q <- 1:I
+      Q <- setdiff(Q,biclusters_mn[['rows']])
+      for(q in Q){
+#6. if row_q AND pattern_mn == pattern_mn        
+        rho_mnq <- bitwAnd(Xbw[q,],rho_mn)
+
+
+        if(identical(rho_mnq,rho_mn)){
+#7. add q to rows in Bic_mn          
+          biclusters_mn[['rows']] <- c(biclusters_mn[['rows']],q)
+        }
+      }
+#10. if n_rows in Bic_mn >= mnr, add to biclusters list      
+      #print(paste0('rows=',length(biclusters_mn[['rows']])))
+      if(length(biclusters_mn[['rows']])>=mnr){
+          biclusters <- append(biclusters,list(biclusters_mn))
+      }
+  }
+
+
+time_sch_end <- Sys.time()
+  time_sch <- round(as.numeric(difftime(time_sch_end, time_sch_start, units = "secs")),4)
+  
+  out_searching <- vector("list",2)
+  out_searching[[1]] <- biclusters
+  out_searching[[2]] <- time_sch
+
+  return(out_searching)
+}
+```
+
+### 
+
+### Set Global Parameters
+
+Bit word length: from 2 to ceil(log~2~(n): try bitwords from length 2 until a set maximum that optimizes computation time (see supplementary material for extended explanation).
+
+Combinations of mnr and mnc will be tried from 2 to 10.
+
+```{r global_params}
+
+m = nrow(X)
+n = ncol(X)
+
+#bitword length
+bwl_range <- 2:(ceiling(log2(n)))
+
+#minimum number of rows and columns per bicluster
+mnr_range <- 2:10
+mnc_range <- 2:10
+
+```
+
+## Main Loop
+
+Performs Bibit runs for all bwl, mnr and mnc and stores basic statistics for each run. Print statements can be uncommented for tracking progress or debugging.
+
+```{r}
+time_global_start <- Sys.time()
+nrun <- 0
+maxrun <- length(bwl_range)*length(mnr_range)*length(mnc_range)
+for(bwl in bwl_range){
+  for(mnr in mnr_range){
+    for(mnc in mnc_range){
+      nrun <- nrun + 1
+      time_run_start <- Sys.time()
+      print(paste0('running bibit using bwl=',bwl,' mnr=',mnr,' mnc=',mnc))
+
+      out_encoding <- bb_encoding(Xbin,m,n,bwl)
+      Xbw <- out_encoding[[1]]
+      time_enc <- out_encoding[[2]]
+      #print(paste0('      encoding finished in ',time_enc,' s'))
+      
+      out_searching <- bb_searching(Xbw,mnr,mnc)
+      list_biclusters <- out_searching[[1]]
+      time_sch <- out_searching[[2]]
+      #print(paste0('      searching finished in ',time_sch,' s'))
+      
+
+      time_run_end <- Sys.time()
+      n_biclust <- length(list_biclusters)
+      time_run <- round(as.numeric(difftime(time_run_end, time_run_start, units = "secs")),4)
+      print(paste0('      found ',n_biclust,' biclusters in ',time_run,' s'))
+      
+      
+      if(n_biclust>0){
+        #print('      storing found biclusters and run stats...')
+        #store biclusters:
+        runs_bc[[nrun]] <- list_biclusters
+  
+        #get the rows and columns in the biclusters
+        bc_allrows <- c()
+        bc_allcols <- c()
+        for(i in 1:length(list_biclusters)){
+          bc_allrows <- append(bc_allrows,list_biclusters[[i]][["rows"]])
+          bc_allcols <- append(bc_allcols,list_biclusters[[i]][["cols"]])
+          }
+        n_rows <- length(unique(bc_allrows))
+        n_cols <- length(unique(bc_allcols))
+      }else{
+        #print('      storing run stats...')
+        n_rows <- 0
+        n_cols <- 0
+      }
+
+      #store run stats:
+      aux_stats_run_row <- c(bwl,mnr,mnc,n_biclust,n_rows,n_cols,time_enc,time_sch,time_run)
+      aux_colnames <- c('bwl','mnr','mnc','biclusters','rows_all','cols_all','time_enc','time_sch','time')
+      colnames(stats_run) <- aux_colnames
+      stats_run <- rbind(stats_run,aux_stats_run_row)
+      
+      #progress
+      aux_pc <- round(nrun/maxrun*100,2)
+      print(paste0('      run ',nrun,'/',maxrun,' completed (',aux_pc,'%)'))
+    }
+  }
+}
+
+time_global_end <- Sys.time()
+time_global <- round(as.numeric(difftime(time_global_end, time_global_start, units = "secs")),4)
+
+#display time in seconds
+print(paste('performed',nrun,'runs with different combinations of bwl, mnr, mnc in',time_global,'s'))
+
+#converts time to minutes if >60 seconds, to hours if >60 minutes
+time_string <- format_time(time_global)
+#display reformatted time
+print(paste('performed',nrun,'runs with different combinations of bwl, mnr, mnc in', time_string))
+
+#export stats as csv, rename as needed
+stats_run <- as.data.frame(stats_run)
+rownames(stats_run) <- 1:nrow(stats_run)
+write.csv(stats_run,"data/Bibit-stats_run-16SIBD.csv", row.names = TRUE)
+
+```
+
+## Performance Plots
+
+### Focus on found biclusters across runs
+
+Extract the number of rows and columns from the biclusters found across all runs:
+
+```{r stats_bc}
+
+r<-0
+
+for(bwl in bwl_range){
+  for(mnr in mnr_range){
+    for(mnc in mnc_range){
+      r <- r+1
+      n_biclust <- length(runs_bc[[r]])
+      for(bcc in 1:n_biclust){
+        aux_rows <- length(runs_bc[[r]][[bcc]][['rows']])
+        aux_cols <- length(runs_bc[[r]][[bcc]][['cols']])
+        aux_stats_bc_row <- c(r,bwl,mnr,mnc,bcc,aux_rows,aux_cols)
+        stats_bc <- rbind(stats_bc,aux_stats_bc_row)
+      }
+    }
+  }
+}
+stats_bc <- as.data.frame(stats_bc)
+rownames(stats_bc) <- 1:nrow(stats_bc)
+write.csv(stats_bc,"data/Bibit-stats_bc-16SIBD.csv", row.names = TRUE)
+
+```
+
+For every run, get summary statistics on the rows and columns of their found biclusters.
+
+```{r stats_run_summ}
+
+for(r in 1:nrun){
+  aux_run_bcs <- stats_bc[stats_bc$run==r,c('rows','cols')]
+  aux_summ_rows <- summary(aux_run_bcs$rows)
+  aux_summ_cols <- summary(aux_run_bcs$cols)
+  aux_stats_bc_summ_row <- c(aux_summ_rows,aux_summ_cols)
+  stats_run_summ <- rbind(stats_run_summ,aux_stats_bc_summ_row)
+}
+```
+
+#### Histograms: clustered rows, columns and run duration
+
+Histograms for runs: biclusters found, clustered rows, clustered columns, total time, average time per bicluster
+
+```{r hist_runs}
+
+#summary: most/least bcs found, time, coverage (found / all rows and cols), overlaps, shortest/longest run
+
+
+hist(stats_run$biclusters,breaks=50,xlab='biclusters',ylab='runs',main='Biclusters found')
+
+
+#filter out outlier number of biclusters
+aux_maxbc <- max(stats_run$biclusters)
+stats_run_filtered <- stats_run[stats_run$biclusters<aux_maxbc,]
+
+
+hist(stats_run_filtered$biclusters,breaks=50,xlab='biclusters',ylab='runs',main='Biclusters found (filtered)')
+
+hist(stats_run$rows,breaks=50,xlab='no. unique rows',ylab='runs',main='Clustered rows')
+hist(stats_run$cols,breaks=50,xlab='no. unique columns',ylab='runs',main='Clustered columns')
+hist(stats_run$time*1000,breaks=50,xlab='time (ms)',ylab='runs',main='Run duration')
+
+stats_run$time_bc <- 1000*stats_run$time/stats_run$biclusters
+stats_run_filtered$time_bc <- 1000*stats_run_filtered$time/stats_run_filtered$biclusters
+hist(stats_run$time_bc,breaks=50,xlab='time (ms)',ylab='runs',main='Average time per bicluster')
+
+
+print('summary: biclusters found across all runs')
+summary(stats_run$biclusters)
+print('----------------------------------------')
+print('summary: biclusters found across filtered runs')
+summary(stats_run_filtered$biclusters)
+print('----------------------------------------')
+print('summary: clustered rows')
+summary(stats_run$rows_all)
+print('----------------------------------------')
+print('summary: clustered rows (filtered runs)')
+summary(stats_run_filtered$rows_all)
+print('----------------------------------------')
+print('summary: clustered columns')
+summary(stats_run$cols_all)
+print('----------------------------------------')
+print('summary: clustered columns (filtered runs)')
+summary(stats_run_filtered$cols_all)
+print('----------------------------------------')
+print('summary: run duration (s)')
+summary(stats_run$time*1000)
+print('----------------------------------------')
+print('summary: average time per bicluster (ms)')
+summary(stats_run$time_bc)
+
+```
+
+#### Scatter plots: effect of mnr and mnc on number of found clusters
+
+```{r plot_bc_mnr_mnc_1}
+
+plot(stats_run_filtered$mnr,stats_run_filtered$biclusters,main="Found biclusters by mnr setting",xlab="mnr",ylab="biclusters")
+
+aux_lm <- lm(stats_run_filtered$biclusters~stats_run_filtered$mnc)
+aux_lm_summ <- summary(aux_lm)
+aux_rsq <- aux_lm_summ$r.squared
+plot(stats_run_filtered$mnc,stats_run_filtered$biclusters,main="Found biclusters by mnc setting",xlab="mnc",ylab="biclusters")
+
+```
+
+#### Scatter plots: effect of mnr and mnc on clustered rows and columns
+
+```{r plot_bc_mnr_mnc_2}
+
+plot(stats_run$mnr,stats_run$rows_all,main="Clustered rows by mnr setting",xlab="mnr",ylab="clustered rows")
+
+plot(stats_run$mnr,stats_run$cols_all,main="Clustered columns by mnr setting",xlab="mnr",ylab="clustered columns")
+
+plot(stats_run$mnc,stats_run$rows_all,main="Clustered rows by mnc setting",xlab="mnc",ylab="clustered rows")
+plot(stats_run$mnc,stats_run$cols_all,main="Clustered columns by mnc setting",xlab="mnc",ylab="clustered columns")
+
+```
+
+### Focus on time
+
+#### Effect of bwl
+
+```{r scatter_time_bwl}
+
+plot(stats_run$bwl,stats_run$time*1000,main='Run duration by bwl',xlab='bwl',ylab='time (ms)')
+plot(stats_run$bwl,stats_run$time_enc*1000,main='Encoding time by bwl',xlab='bwl',ylab='encoding time (ms)')
+plot(stats_run$bwl,stats_run$time_sch*1000,main='Searching time by bwl',xlab='bwl',ylab='searching time (ms)')
+plot(stats_run$bwl,stats_run$time_bc*1000,main='Average time per bicluster by bwl',xlab='bwl',ylab='average time per bicluster (ms)')
+
+
+
+
+
+
+
+```
+
+#### Effect of mnr
+
+```{r scatter_time_mnr}
+#par(mfrow = c(2,2))
+
+plot(stats_run$mnr,stats_run$time*1000,main='Run duration by mnr',xlab='mnr',ylab='time (ms)')
+plot(stats_run$mnr,stats_run$time_enc*1000,main='Encoding time by mnr',xlab='mnr',ylab='encoding time (ms)')
+plot(stats_run$mnr,stats_run$time_sch*1000,main='Searching time by mnr',xlab='mnr',ylab='searching time (ms)')
+plot(stats_run$mnr,stats_run$time_bc*1000,main='Average time per bicluster by mnr',xlab='mnr',ylab='average time per bicluster (ms)')
+
+
+
+
+
+
+```
+
+#### Effect of mnc
+
+```{r scatter_time_mnc}
+#par(mfrow = c(2,2))
+
+plot(stats_run$mnc,stats_run$time*1000,main='Run duration by mnc',xlab='mnc',ylab='time (ms)')
+plot(stats_run$mnc,stats_run$time_enc*1000,main='Encoding time by mnc',xlab='mnc',ylab='encoding time (ms)')
+plot(stats_run$mnc,stats_run$time_sch*1000,main='Searching time by mnc',xlab='mnc',ylab='searching time (ms)')
+plot(stats_run$mnc,stats_run$time_bc*1000,main='Average time per bicluster by mnc',xlab='mnc',ylab='average time per bicluster (ms)')
+
+
+
+
+
+
+```
+
+```{r}
+aux_22 <- stats_bc[stats_bc$run %in% seq(1,649,by=81),]
+aux_22 <- aux_22[aux_22$run==1,]
+summary(aux_22$rows)
+summary(aux_22$cols)
+hist(aux_22$rows,breaks = 50)
+hist(aux_22$cols,breaks = 50)
+as.data.frame(table(aux_22$rows))
+as.data.frame(table(aux_22$cols))
+plot(aux_22$cols,aux_22$rows)
+```
+
+```{r}
+aux_43 <- stats_run[stats_run$rows_all ==43,]
+#aux_43 <- aux_43[aux_43$run==1,]
+summary(aux_43$rows)
+summary(aux_43$cols)
+hist(aux_43$rows,breaks = 50)
+hist(aux_43$cols,breaks = 50)
+as.data.frame(table(aux_43$rows))
+as.data.frame(table(aux_43$cols))
+plot(aux_22$cols,aux_43$rows)
+```
+
+## Save R environment
+
+```{r env_save}
+save.image(file = "data/Bibit-supplement-16SIBD.RData", compress = TRUE)
+```
+
+```{r env_load}
+load(file = "data/Bibit-supplement-16SIBD.RData")
+```

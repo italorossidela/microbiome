@@ -1,0 +1,1452 @@
+---
+title: "Microbiome Data Analysis Using Biclustering Approaches - Bibit"
+author: "Italo Rossi del Aguila"
+format: pdf
+editor: visual
+---
+
+```{r libraries}
+#| echo: false
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+```
+
+# Data Set
+
+### Load data
+
+During import, transpose to place samples on the rows and taxa on the columns. Load metadata for labeling and coloring plots.
+
+```{r data_load, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+X <- read.delim("data/microbiome_dataSet1.tsv",row.names=1)
+X <- t(as.matrix(X))
+X_meta <- read.delim("data/microbiome_dataSet1_sampleInfo.tsv",row.names=1)
+X_taxo <- read.delim("data/microbiome_dataSet1_taxonomy.tsv",row.names=1)
+```
+
+### Mark ambigous taxonomy as *incertae sedis*
+
+To facilitate taxonomic-level analyses, we will update all ambiguous labels as incertae sedis.
+
+```{r data_load_factors, iclude=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#back up original taxonomy table
+X_taxo_old <- X_taxo
+
+#update all ambiguities in phylum, class, order, family and genus
+X_taxo$phylum <- ifelse(grepl("/", X_taxo$phylum), "incertae sedis", X_taxo$phylum)
+X_taxo$phylum <- ifelse(grepl("incertae", X_taxo$phylum, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$phylum)
+X_taxo$class <- ifelse(grepl("/", X_taxo$class), "incertae sedis", X_taxo$class)
+X_taxo$class <- ifelse(grepl("incertae", X_taxo$class, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$class)
+X_taxo$order <- ifelse(grepl("/", X_taxo$order), "incertae sedis", X_taxo$order)
+X_taxo$order <- ifelse(grepl("incertae", X_taxo$order, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$order)
+X_taxo$family <- ifelse(grepl("/", X_taxo$family), "incertae sedis", X_taxo$family)
+X_taxo$family <- ifelse(grepl("incertae", X_taxo$family, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$family)
+X_taxo$genus <- ifelse(grepl("/", X_taxo$genus), "incertae sedis", X_taxo$genus)
+X_taxo$genus <- ifelse(grepl("incertae", X_taxo$genus, ignore.case = TRUE), 
+                         "incertae sedis", 
+                         X_taxo$genus)
+
+as.data.frame(table(X_taxo$phylum))
+as.data.frame(table(X_taxo$class))
+as.data.frame(table(X_taxo$order))
+as.data.frame(table(X_taxo$family))
+as.data.frame(table(X_taxo$genus))
+
+```
+
+### Basic Filtering
+
+Find any null/NA values and set them to 0. Eliminate all-zero rows and columns. Check for any negative values.
+
+```{r data_trns, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#NAs to zeros
+X[is.na(X)] <- 0
+
+#remove all-zero samples
+aux_allzero <- which(rowSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[-aux_allzero,]
+}
+
+#remove all-zero taxa
+aux_allzero <- which(colSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[,-aux_allzero]
+}
+
+rm(aux_allzero)
+
+if(any(X<0)){
+  print("X has negative values. DO NOT CONTINUE.")
+}
+
+I <- dim(X)[1]; J <- dim(X)[2]
+```
+
+### Filtering rare taxa
+
+Find and remove rare taxa: OTUs with only one count across all samples
+
+```{r EDA_filter}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_rare <- which(colSums(X)==1)
+X <- X[,-aux_rare]
+
+#update dimension variables I and J
+I <- dim(X)[1]; J <- dim(X)[2]
+
+rm(aux_rare)
+```
+
+### Preprocessing
+
+#### Binary data matrix
+
+$$
+f(x) =
+\begin{cases} 
+1 & \text{if } x > 0, \\
+0 & \text{otherwise.}
+\end{cases}
+$$
+
+```{r pre_bin}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xbin <- X
+Xbin[Xbin>0] <- 1
+
+heatmap(Xbin, Rowv=NA, Colv=NA, scale="none", main="X (filtered + binarized)", cexRow=0.5, cexCol=0.1)
+```
+
+# Bibit
+
+## Global objects
+
+```{r pre_objects}
+#| echo: false
+#| message: false
+#| warning: false
+
+#list with all biclusters
+biclusters <- vector("list")
+
+#list for each bicluster, with 7 objects each
+rows <- list()
+cols <- list()
+pattern <- ''
+
+biclusters_sub <- list('rows'=rows,'cols'=cols,'pattern'=pattern)
+
+stats_bc <- matrix(nrow=0,ncol=3)
+aux_colnames <- c('bc','rows','cols')
+colnames(stats_bc) <- aux_colnames
+
+rm(aux_colnames)
+```
+
+## Functions
+
+Encoding, searching and decoding will be called from a loop over the different bit word lengths, MNR and MNC
+
+### General and formatting
+
+Takes seconds as an input, returns minutes if \>= 60 seconds, hours if \>= 3600 seconds.
+
+```{r func_format}
+#| echo: false
+#| message: false
+#| warning: false
+
+
+format_time <- function(seconds) {
+  if (seconds < 60) {
+    return(paste(round(seconds, 2), "seconds"))
+  } else if (seconds < 3600) {
+    minutes <- seconds / 60
+    return(paste(round(minutes, 2), "minutes"))
+  } else {
+    hours <- seconds / 3600
+    return(paste(round(hours, 2), "hours"))
+  }
+}
+
+```
+
+### Matrix: off-diagonal maximum
+
+Used during merging. Takes a diagonal matrix of inter-cluster Jaccard indices and returns the highest value and the corresponding positions.
+
+```{r func_general}
+#| echo: false
+#| message: false
+#| warning: false
+
+#check the highest off-diagonal value of a square matrix
+off_diagonal_max <- function(matrix) {
+  n <- nrow(matrix)
+  aux_max <- -1
+  matches <- list()
+  
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+      if (i != j) {
+        if (matrix[i, j] > aux_max) {
+          aux_max <- matrix[i, j]
+          matches <- list(list(row = i, col = j))
+        } else if (matrix[i, j] == aux_max) {
+          matches <- c(matches, list(list(row = i, col = j)))
+        }
+      }
+    }
+  }
+  
+  return(list(value = aux_max, positions = matches))
+}
+
+
+```
+
+### Encoding
+
+Phase 1 of Bibit. Takes a binarized matrix as input and returns a matrix encoded into bit words for faster computation when comparing row contents.
+
+```{r func_encoding}
+#| echo: false
+#| message: false
+#| warning: false
+
+bb_encoding <- function(Xbin,I,J,bwl){
+  time_enc_start <- Sys.time()
+
+    #empty matrix to store the bitword-encoded matrix
+  Xbw <- matrix(, nrow = 0, ncol = ceiling(J/bwl))
+  
+  for(i in 1:I){
+    m <- 1
+    aux_row <- c()
+    for(j in seq(1,J,by=bwl)){
+      aux_bitword <- ''
+      for(k in 0:(bwl-1)){
+        if(j+k <= J){
+          aux_bitword <- paste0(aux_bitword,Xbin[i,j+k])
+        }
+      }
+      aux_row[m] <- strtoi(aux_bitword, base=2)
+      if(m<ceiling(J/bwl)){
+        m <- m+1
+      }
+    }
+    Xbw <- rbind(Xbw,aux_row)
+  }
+  
+  time_enc_end <- Sys.time()
+  time_enc <- round(as.numeric(difftime(time_enc_end, time_enc_start, units = "secs")),4)
+  
+  out_encoding <- vector("list",2)
+  out_encoding[[1]] <- Xbw
+  out_encoding[[2]] <- time_enc
+
+  return(out_encoding)
+}
+
+```
+
+### Searching
+
+Phase 2 of Bibit. Takes the bitword-encoded matrix from the encoding phase, mnr and mnc. For every pair of rows (r~m~,r~n~), a pattern $\rho_{mn}$ is formed by performing a bitwise AND operation. If the number of 1s in $\rho_{mn}$ is \>= mnc, a bitwise AND operation is performed on each of the remainder rows of the encoded matrix. If the resulting pattern is equal to the original pattern, the row gets added to a temporary bicluster. After checking every remainder row, if the total number of rows in the temporary bicluster \>= mnr, the temporary bicluster is added to the global list of biclusters. The searching phase finishes when the pattern has been compared with all remainder rows.
+
+Comments make reference to the line numbers of Algorithm 1
+
+```{r func_searching}
+#| echo: false
+#| message: false
+#| warning: false
+
+bb_searching <- function(Xbw,mnr,mnc){
+
+  time_sch_start <- Sys.time()
+
+#empty object to store patterns
+found_patterns <- c()    
+
+# Generate all row pairs
+aux_rowpairs <- combn(1:I, 2)
+
+# ALGORITHM 1
+# 1. for every rows pair (r_m,r_n) do
+for(i in 1:ncol(aux_rowpairs)){
+  m <- aux_rowpairs[1,i]
+  n <- aux_rowpairs[2,i]
+  #print(paste0('comparing r',m,' and r',n))
+  
+#2. rho_mn = r_m ^ r_n  
+  rho_mn <- bitwAnd(Xbw[m,],Xbw[n,])
+
+  # 2.1 get number of 1's in rho_mn:
+  # 2.1.1 convert integer bitwords to binary strings of length bwl
+  bw2bin <- sapply(rho_mn, function(x) {
+    binary <- as.integer(intToBits(x))  #bitword: integer to binary (length 32)
+    binary <- rev(binary[1:bwl])       #select the first bwl bits and reverse
+    paste(binary, collapse = "")       #single bwl-bit long string
+  })
+  
+  # 2.1.2 from binary strings to J-length pattern string
+  n_bw <- length(bw2bin) #number of bitwords
+  if(n_bw*bwl!=J){ #if number of bitwords*bwl != J
+    nbits_tail <- bwl-(n_bw*bwl-J) #get number of necessary encoding bits at last bitword
+    bw2bin[n_bw] <- str_sub(bw2bin[n_bw],-nbits_tail) #trim last bitword to encoding bits
+  }
+  pattern <- paste(bw2bin,collapse='') #binarized bitwords to J-length binary string
+
+  # 2.2 (FOR LINE 3) get number of 1s from J-length pattern string
+  pattern_1s <- str_count(pattern,'1')
+
+  # 2.3 (FOR LINE 3) check if the pattern is new
+  if ((pattern %in% found_patterns)){
+      flag.new <- 0
+      found_patterns <- c(found_patterns, pattern)
+  }else{
+    flag.new <- 1
+  }
+#3. if pattern is new and number of 1s in pattern >=mnc:
+  #print(paste0('rho_',m,'_',n,': flag.new=',flag.new,' cols=',pattern_1s))
+  if(flag.new & pattern_1s>=mnc){
+#4. create and populate  Bic_mn bicluster
+    biclusters_mn <- biclusters_sub #empty object to populate
+    biclusters_mn[['rows']] <- c(m,n) #store rows M
+    
+    aux_chars <- strsplit(pattern, "")[[1]] #split pattern as vector to find 1s
+    biclusters_mn[['cols']] <- which(aux_chars=='1') #store 1s as columns N
+    
+    biclusters_mn[['pattern']] <- rho_mn #store bitword pattern
+
+    
+    
+    
+   
+}#5. for every remainder row q in Q
+      Q <- 1:I
+      Q <- setdiff(Q,biclusters_mn[['rows']])
+      for(q in Q){
+#6. if row_q AND pattern_mn == pattern_mn        
+        rho_mnq <- bitwAnd(Xbw[q,],rho_mn)
+
+
+        if(identical(rho_mnq,rho_mn)){
+#7. add q to rows in Bic_mn          
+          biclusters_mn[['rows']] <- c(biclusters_mn[['rows']],q)
+        }
+      }
+#10. if n_rows in Bic_mn >= mnr, add to biclusters list      
+      #print(paste0('rows=',length(biclusters_mn[['rows']])))
+      if(length(biclusters_mn[['rows']])>=mnr){
+          biclusters <- append(biclusters,list(biclusters_mn))
+      }
+  }
+
+
+time_sch_end <- Sys.time()
+  time_sch <- round(as.numeric(difftime(time_sch_end, time_sch_start, units = "secs")),4)
+  
+  out_searching <- vector("list",2)
+  out_searching[[1]] <- biclusters
+  out_searching[[2]] <- time_sch
+
+  return(out_searching)
+}
+```
+
+### Recursive Merging
+
+Group of functions to recursively merge biclusters above a specified Jaccard index threshold over a specified measure (rows, columns, average). Returns a list of merged biclusters.
+
+```{r merging_recursive_func}
+#| echo: false
+#| message: false
+#| warning: false
+
+#jaccard index between two biclusters
+bc_jaccard <- function(bc_i,bc_j,measure){
+  rows_I <- length(intersect(bc_i[['rows']],bc_j[['rows']]))
+  rows_U <- length(union(bc_i[['rows']],bc_j[['rows']]))
+  cols_I <- length(intersect(bc_i[['cols']],bc_j[['cols']]))
+  cols_U <- length(union(bc_i[['cols']],bc_j[['cols']]))
+  
+  rows_jaccard <- rows_I/rows_U
+  cols_jaccard <- cols_I/cols_U
+  
+  return(
+    switch(measure,
+    'rows'=rows_jaccard,
+    'cols'=cols_jaccard,
+    'avg'=mean(c(rows_jaccard,cols_jaccard)))
+  )
+  
+  
+}
+
+
+#merge two biclusters
+bc_merge <- function(bc_i,bc_j){
+  list(
+    rows = union(bc_i[['rows']],bc_j[['rows']]),
+    cols = union(bc_i[['cols']],bc_j[['cols']]),
+    initial_bc = sort(union(bc_i[['initial_bc']],bc_j[['initial_bc']]))
+  )
+}
+
+#recursive merging
+bc_merge_r <- function(biclusters,threshold,measure){
+  n <- length(biclusters)
+  if(n<=1){
+    return(biclusters)
+  }else{
+    print(paste(n,'biclusters left...'))
+    jaccard_matrix <- matrix(0,n,n)
+    for(i in 1:(n-1)){
+      for(j in (i+1):n){
+        #print(paste0('i=',i,' j=',j))
+        jaccard_matrix[i,j] <- bc_jaccard(biclusters[[i]],biclusters[[j]],measure)
+      }
+    }
+    
+    #find the maximum overlap
+    jaccard_max <- max(jaccard_matrix)
+    
+    if(jaccard_max<=threshold){
+      #if no pairs above threshold, return original bicluster list
+      return(biclusters)
+    }else{
+      #find the pair of biclusters to merge
+      max_indices <- which(jaccard_matrix == jaccard_max, arr.ind = TRUE)[1,]
+      i <- max_indices[1]
+      j <- max_indices[2]
+      bc_i <- biclusters[[i]]
+      bc_j <- biclusters[[j]]
+      print(paste('merging biclusters',bc_i$initial_bc,'and',bc_j$initial_bc))
+      #merge biclusters
+      bc_merged <- bc_merge(bc_i,bc_j)
+      
+      #create new biclusters list
+      biclusters_new <- biclusters[-c(i,j)]
+      biclusters_new[[length(biclusters_new) + 1]] <- bc_merged
+      
+      #recursive call
+      bc_merge_r(biclusters_new,threshold,measure)
+    }
+  }
+}
+
+```
+
+## Set Global Parameters
+
+After analyzing different run parameters, we choose a balance between:
+
+-   Bit word length (bwl): longer words lead to shorter times. The maximum useful length is ceiling(log2(n))
+
+-   Minimum number of rows (mnr): greater than 1 (a bicluster can be formed with a group at least two samples).
+
+-   Minimum number of columns (mnc): greater than 1. A group of samples is allowed have at least 2 OTUs in common.
+
+Across multiple combinations (see Bibit_supplement.qmd), we found that setting mnr=4 and mnc=10 with bwl=10 assigns all samples to a bicluster while managing to assign close to the maximum number of columns for non-minimal-sized parameters. bwl set to 10 showed the fastest performance
+
+```{r global_params}
+#| echo: false
+#| message: false
+#| warning: false
+
+I = nrow(X)
+J = ncol(X)
+
+#bitword length
+bwl <- (ceiling(log2(J)))
+mnr <- 4
+mnc <- 10
+
+```
+
+## 
+
+## Main Loop
+
+Runs bibit with the set parameters
+
+```{r bibit_main}
+time_global_start <- Sys.time()
+
+print(paste0('running Bibit using bwl=',bwl,' mnr=',mnr,' mnc=',mnc))
+
+out_encoding <- bb_encoding(Xbin,I,J,bwl)
+Xbw <- out_encoding[[1]]
+time_enc <- out_encoding[[2]]
+print(paste0('      encoding finished in ',time_enc,' s'))
+      
+out_searching <- bb_searching(Xbw,mnr,mnc)
+biclusters <- out_searching[[1]]
+time_sch <- out_searching[[2]]
+print(paste0('      searching finished in ',time_sch,' s'))
+
+      n_biclust <- length(biclusters)
+      if(n_biclust>0){
+        print('analyzing found biclusters...')
+  
+        #get the rows and columns in the biclusters
+        bc_allrows <- c()
+        bc_allcols <- c()
+
+        for(i in 1:n_biclust){
+          bc_rows <- biclusters[[i]][["rows"]]
+          bc_cols <- biclusters[[i]][["cols"]]
+          bc_allrows <- append(bc_allrows,bc_rows)
+          bc_allcols <- append(bc_allcols,bc_cols)
+          bc_allrows <- unique(bc_allrows)
+          bc_allcols <- unique(bc_allcols)
+          aux_stats_bc_row <- c(i,length(bc_rows),length(bc_cols))
+          stats_bc <- as.data.frame(rbind(stats_bc,aux_stats_bc_row))
+        }
+
+        n_rows <- length(unique(bc_allrows))
+        n_cols <- length(unique(bc_allcols))
+      }
+
+for(i in 1:n_biclust){
+  biclusters[[i]][['C']] <- X[biclusters[[i]][["rows"]],biclusters[[i]][["cols"]]]
+}
+      
+time_global_end <- Sys.time()
+time_global <- round(as.numeric(difftime(time_global_end, time_global_start, units = "secs")),4)
+
+time_string <- format_time(time_global)
+
+print(paste('found',n_rows,'rows and',n_cols,'columns across',n_biclust,'biclusters in', time_string))
+#print(paste(m-n_rows,'rows and',n-n_cols,'columns are not part of any biclusters'))
+print(paste(if(I-n_rows>0){paste(I-n_rows,'rows')}else{paste('')},
+            if(J-n_cols>0){paste(J-n_cols,'columns')}else{paste('')},
+            'are not part of any biclusters'))
+
+rm(out_encoding,out_searching,time_enc,time_sch,time_global,time_global_start,time_global_end,time_string,i,aux_stats_bc_row)
+```
+
+## Cluster Analysis
+
+### Descriptive statistics
+
+Histograms:
+
+-   Number of rows and columns per cluster.
+
+-   Cluster dimensions (rows \* columns).
+
+-   Cluster sparsity: proportion of zeros per cluster.
+
+```{r bc_stats}
+hist(stats_bc$rows,breaks=n_biclust,main="Number of rows per cluster")
+hist(stats_bc$cols,breaks=n_biclust,main="Number of columns per cluster")
+
+stats_bc$dim <- stats_bc$rows*stats_bc$cols
+hist(stats_bc$dim,breaks=n_biclust,main="Cluster dimensions (row*col)")
+
+stats_bc$sparsity <- 0
+for(bcc in 1:length(biclusters)){
+  stats_bc[bcc,'sparsity'] <- length(which(biclusters[[bcc]][["C"]]==0))/stats_bc[bcc,'dim']
+}
+hist(stats_bc$sparsity,breaks=n_biclust,main="Cluster sparsity")
+
+```
+
+### Compute inter-cluster Jaccard index
+
+For all found clusters, compute a pairwise Jaccard index:
+
+-   At the row level: IoU~rows~
+
+-   At the column level: IoU~cols~
+
+-   Average of both matrices
+
+Output: symmetric matrices
+
+```{r bc_iou}
+#| echo: false
+#| message: false
+#| warning: false
+
+# housekeeping: delete IoU matrices for reruns
+biclusters[['iou_rows']] <- NULL
+biclusters[['iou_cols']] <- NULL
+biclusters[['iou_avg']] <- NULL
+biclusters[['iou_rows_max']] <- NULL
+biclusters[['iou_cols_max']] <- NULL
+biclusters[['iou_avg_max']] <- NULL
+
+# compute IoU matrices for rows and for columns
+n_biclust <- length(biclusters)
+if(n_biclust>1){
+  print(paste0('computing Jaccard index between ',n_biclust,' biclusters...'))
+  aux_intersect_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_intersect_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  
+  for(bc in 1:n_biclust){
+    for(bcc in 1:n_biclust){
+      aux_intersect_rows[bc,bcc] <- length(intersect(biclusters[[bc]][["rows"]],
+                                                     biclusters[[bcc]][["rows"]]))
+      aux_intersect_cols[bc,bcc] <- length(intersect(biclusters[[bc]][["cols"]],
+                                                     biclusters[[bcc]][["cols"]]))
+      aux_union_rows[bc,bcc] <- length(union(biclusters[[bc]][["rows"]],
+                                             biclusters[[bcc]][["rows"]]))
+      aux_union_cols[bc,bcc] <- length(union(biclusters[[bc]][["cols"]],
+                                             biclusters[[bcc]][["cols"]]))
+      aux_iou_rows[bc,bcc] <- round(aux_intersect_rows[bc,bcc]/aux_union_rows[bc,bcc],4)
+      aux_iou_cols[bc,bcc] <- round(aux_intersect_cols[bc,bcc]/aux_union_cols[bc,bcc],4)
+    }
+
+    # store computed IoU matrices
+    biclusters[["iou_rows"]] <- aux_iou_rows
+    biclusters[["iou_cols"]] <- aux_iou_cols
+    
+    # get highest IoU: jaccard index and bicluster indices
+    biclusters[["iou_rows_max"]] <- off_diagonal_max(aux_iou_rows)
+    biclusters[["iou_cols_max"]] <- off_diagonal_max(aux_iou_cols)
+    
+  }
+}
+
+# average of both IoU matrices
+aux_iou_avg <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+for(i in 1:n_biclust){
+  for(j in 1:n_biclust){
+    aux_iou_avg[i,j] <- (biclusters[['iou_rows']][i,j]+biclusters[['iou_cols']][i,j])/2
+  }
+}
+
+# store computed average IoU matrix
+biclusters[['iou_avg']] <- aux_iou_avg
+biclusters[["iou_avg_max"]] <- off_diagonal_max(aux_iou_avg)
+
+aux_pos_rows <- unlist(biclusters[["iou_rows_max"]][["positions"]])
+aux_pos_cols <- unlist(biclusters[["iou_cols_max"]][["positions"]])
+aux_pos_avg <- unlist(biclusters[["iou_avg_max"]][["positions"]])
+
+print(paste0('highest row overlap: IoU=', biclusters[["iou_rows_max"]][["value"]]))
+bc_i <- aux_pos_rows[1]
+bc_j <- aux_pos_rows[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_rows[1]]][['rows']],biclusters[[aux_pos_rows[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_rows[1]]][['cols']],biclusters[[aux_pos_rows[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_rows, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest column overlap: IoU=', biclusters[["iou_cols_max"]][["value"]]))
+bc_i <- aux_pos_cols[1]
+bc_j <- aux_pos_cols[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_cols[1]]][['rows']],biclusters[[aux_pos_cols[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_cols[1]]][['cols']],biclusters[[aux_pos_cols[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_cols, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest averaged overlap: IoU=', biclusters[["iou_avg_max"]][["value"]]))
+bc_i <- aux_pos_avg[1]
+bc_j <- aux_pos_avg[2]
+
+aux_intersect_rows <- intersect(biclusters[[aux_pos_avg[1]]][['rows']],biclusters[[aux_pos_avg[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters[[aux_pos_avg[1]]][['cols']],biclusters[[aux_pos_avg[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_avg, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+rm(aux_pos_rows,aux_pos_cols,aux_pos_avg,bc_i,bc_j,aux_intersect_rows,aux_intersect_cols,aux_union_rows,aux_union_cols,aux_iou_rows,aux_iou_cols,aux_iou_avg,bc,bcc)
+rm(i,j)
+```
+
+#### Visualize IoU matrices as heatmaps
+
+```{r heatmaps_iou}
+#| echo: false
+#| message: false
+#| warning: false
+
+heatmap(biclusters[["iou_rows"]], Rowv=NA, Colv=NA, scale="none", main='IoU: rows',cexRow=0.5,cexCol=0.5)
+heatmap(biclusters[["iou_cols"]], Rowv=NA, Colv=NA, scale="none", main='IoU: columns',cexRow=0.5,cexCol=0.5)
+heatmap(biclusters[["iou_avg"]], Rowv=NA, Colv=NA, scale="none", main='averaged IoU: rows&columns',cexRow=0.5,cexCol=0.52)
+
+```
+
+Individually check the resulting IoUs between any two biclusters
+
+```{r IoU verify}
+#| echo: false
+#| message: false
+#| warning: false
+
+# edit to compare two biclusters:
+bc_m <- 13
+bc_n <- 16
+
+# get number of rows and columns of both biclusters
+bc_m_nrow <- length(biclusters[[bc_m]][['rows']])
+bc_m_ncol <- length(biclusters[[bc_m]][['cols']])
+bc_n_nrow <- length(biclusters[[bc_n]][['rows']])
+bc_n_ncol <- length(biclusters[[bc_n]][['cols']])
+
+# compute IoU_rows
+aux_in_rows <- length(intersect(biclusters[[bc_m]][['rows']],biclusters[[bc_n]][['rows']]))
+aux_un_rows <- length(union(biclusters[[bc_m]][['rows']],biclusters[[bc_n]][['rows']]))
+aux_iou_rows <- aux_in_rows/aux_un_rows
+
+# compute IoU_cols
+aux_in_cols <- length(intersect(biclusters[[bc_m]][['cols']],biclusters[[bc_n]][['cols']]))
+aux_un_cols <- length(union(biclusters[[bc_m]][['cols']],biclusters[[bc_n]][['cols']]))
+aux_iou_cols <- aux_in_cols/aux_un_cols
+
+# print result
+print(paste0('biclusters ',bc_m,' (',bc_m_nrow,'x',bc_m_ncol,') and ',bc_n,' (',bc_n_nrow,'x',bc_n_ncol,') share ',
+             aux_in_rows,' rows and ',aux_in_cols,' columns'))
+print(paste0('IoU_rows=',round(aux_iou_rows,2),' | IoU_columns=',round(aux_iou_cols,2)))
+```
+
+### Dendrograms: visualize merging candidates
+
+Converting the Jaccard indices into distances, display dendrograms shown possible merging candidates. Set a distance as possible merging threshold and draw it as a horizontal line to evaluate. The choice for linkage method and distance threshold is up to the researcher and findings in the particular data set and the desired "cut point" after viewing the dendrograms.
+
+```{r dendro}
+#| echo: false
+#| message: false
+#| warning: false
+
+#Choose linkage method between: average, median, centroid, single, complete
+aux_linkage <- 'average'
+
+#set possible merging threshold
+aux_thresh <- 0.7
+
+
+# Jaccard index to distance (1 - Jaccard index)
+distance_rows_m <- 1 - biclusters[['iou_rows']]
+distance_cols_m <- 1 - biclusters[['iou_cols']]
+distance_avg_m <- 1 - biclusters[['iou_avg']]
+
+# hierarchical clustering
+# convert distance matrix to "dist" vector
+distance_rows_v <- as.dist(distance_rows_m)
+distance_cols_v <- as.dist(distance_cols_m)
+distance_avg_v <- as.dist(distance_avg_m)
+
+# use average linkage
+hc_rows <- hclust(distance_rows_v, method=aux_linkage)
+hc_cols <- hclust(distance_cols_v, method=aux_linkage)
+hc_avg <- hclust(distance_avg_v, method=aux_linkage)
+
+# plot dendrograms
+plot(hc_rows, labels = paste("BC", 1:n_biclust, sep=""),
+     main=paste("Dendrogram: row-wise similarity",'\n',aux_linkage,'linkage'),
+     xlab="Biclusters", ylab="Distance = 1 - Jrows(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_cols, labels = paste("BC", 1:n_biclust, sep=""),
+     main=paste("Dendrogram: column-wise similarity",'\n',aux_linkage,'linkage'),
+     xlab="Biclusters", ylab="Distance = 1 - Jcols(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_avg, labels = paste("BC", 1:n_biclust, sep=""),
+     main=paste("Dendrogram: averaged row-column similarity",'\n',aux_linkage,'linkage'),
+     xlab="Biclusters", ylab="Distance = 1 - Javerage(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+```
+
+Looking at the three plots, we can make a choice between merging at a distance threshold on the rows, columns or the average, as well as adjust the threshold to a desired level.
+
+```{r dendro_rm}
+#| echo: false
+#| message: false
+#| warning: false
+
+rm(distance_rows_m,distance_rows_v,distance_cols_m,distance_cols_v,distance_avg_m,distance_avg_v)
+```
+
+### Run merging
+
+Looking at the dendrograms, set the threshold and choose the measure dimension between "rows", "cols" and "avg".
+
+```{r merging_recursive}
+
+#set or update the threshold (look at dendrogram above) and set the measure
+aux_thresh <- 0.7
+
+
+#choose between rows, cols, avg
+aux_measure <- 'cols'
+
+if (!(aux_measure %in% c('rows','cols','avg'))) {
+  print(paste('INVALID MEASURE SELECTED:',aux_measure,'// instead, use: rows, cols, avg'))
+}else{
+  # housekeeping: delete IoU matrices for reruns, empty stats_bc_merged
+  biclusters[['iou_rows']] <- NULL
+  biclusters[['iou_cols']] <- NULL
+  biclusters[['iou_avg']] <- NULL
+  biclusters[['iou_rows_max']] <- NULL
+  biclusters[['iou_cols_max']] <- NULL
+  biclusters[['iou_avg_max']] <- NULL
+  
+  stats_bc_merged <- matrix(nrow=0,ncol=4)
+  aux_colnames <- c('bc','rows','cols')
+  colnames(stats_bc_merged) <- c(aux_colnames,'n_mergedbc')
+  
+  
+  time_merge_start <- Sys.time()
+  
+  if(n_biclust>0){
+        print('analyzing found biclusters...')
+  
+        #get the rows and columns in the biclusters
+        bc_allrows <- c()
+        bc_allcols <- c()
+
+        for(i in 1:n_biclust){
+          bc_rows <- biclusters[[i]][["rows"]]
+          bc_cols <- biclusters[[i]][["cols"]]
+          bc_allrows <- append(bc_allrows,bc_rows)
+          bc_allcols <- append(bc_allcols,bc_cols)
+          bc_allrows <- unique(bc_allrows)
+          bc_allcols <- unique(bc_allcols)
+        }
+
+        n_rows <- length(unique(bc_allrows))
+        n_cols <- length(unique(bc_allcols))
+      }
+  
+  #store the original bicluster numbering
+  for(bc in 1:n_biclust){
+    biclusters[[bc]][['initial_bc']] <- bc
+  }
+  
+  print(paste0('Merging biclusters along Jaccard_',aux_measure,' with threshold=',aux_thresh,'...'))
+  biclusters_merged <- bc_merge_r(biclusters, threshold = (1-aux_thresh), measure=aux_measure)
+  n_biclust_merged <- length(biclusters_merged)
+  
+  time_merge_end <- Sys.time()
+  time_merge <- round(as.numeric(difftime(time_merge_end, time_merge_start, units = "secs")),4)
+  time_string <- format_time(time_merge)
+  
+  print(paste('merged',n_biclust,'biclusters into',n_biclust_merged,'in', time_string))
+  
+  for(i in 1:n_biclust_merged){
+    bc_rows <- biclusters_merged[[i]][["rows"]]
+    bc_cols <- biclusters_merged[[i]][["cols"]]
+    bc_n_merged <- unique(biclusters_merged[[i]][["initial_bc"]])
+    bc_allrows <- append(bc_allrows,bc_rows)
+    bc_allcols <- append(bc_allcols,bc_cols)
+    bc_allrows <- unique(bc_allrows)
+    bc_allcols <- unique(bc_allcols)
+    aux_stats_bc_row <- c(i,length(bc_rows),length(bc_cols),length(bc_n_merged))
+    stats_bc_merged <- as.data.frame(rbind(stats_bc_merged,aux_stats_bc_row))
+    }
+}
+rownames(stats_bc_merged) <- 1:n_biclust_merged
+
+#update C matrix (subset of Xsqrt)
+for(bcc in 1:n_biclust_merged){
+  aux_rows <- biclusters_merged[[bcc]][['rows']]
+  aux_cols <- biclusters_merged[[bcc]][['cols']]
+  biclusters_merged[[bcc]][['C']] <- as.data.frame(X[aux_rows,aux_cols])
+}
+
+rm(time_merge_start,time_merge_end,time_merge,time_string)
+```
+
+```{r bc_merged_table}
+#| echo: false
+#| message: false
+#| warning: false
+
+stats_bc_merged$dim <- stats_bc_merged$rows*stats_bc_merged$cols
+stats_bc_merged$sparsity <- 0
+for(bcc in 1:length(biclusters_merged)){
+  stats_bc_merged[bcc,'sparsity'] <- length(which(biclusters_merged[[bcc]][["C"]]==0))/stats_bc_merged[bcc,'dim']
+}
+
+
+#stats_bc_merged_table <- stats_bc_merged[,c('bc','rows','cols')]
+#stats_bc_merged_table$density <- 1 - stats_bc_merged$sparsity
+
+#stats_bc_merged_table
+```
+
+### Jaccard Index on merged clusters
+
+Verify whether the merged biclusters maintain any significant overlaps.
+
+```{r bc_iou_merged}
+#| echo: false
+#| message: false
+#| warning: false
+
+# housekeeping: delete IoU matrices for reruns
+biclusters_merged[['iou_rows']] <- NULL
+biclusters_merged[['iou_cols']] <- NULL
+biclusters_merged[['iou_avg']] <- NULL
+biclusters_merged[['iou_rows_max']] <- NULL
+biclusters_merged[['iou_cols_max']] <- NULL
+biclusters_merged[['iou_avg_max']] <- NULL
+
+# compute IoU matrices for rows and for columns
+n_biclust <- length(biclusters_merged)
+if(n_biclust>1){
+  print(paste0('computing Jaccard index between ',n_biclust,' biclusters...'))
+  aux_intersect_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_intersect_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_union_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_rows <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  aux_iou_cols <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+  
+  for(bc in 1:n_biclust){
+    for(bcc in 1:n_biclust){
+      aux_intersect_rows[bc,bcc] <- length(intersect(biclusters_merged[[bc]][["rows"]],
+                                                     biclusters_merged[[bcc]][["rows"]]))
+      aux_intersect_cols[bc,bcc] <- length(intersect(biclusters_merged[[bc]][["cols"]],
+                                                     biclusters_merged[[bcc]][["cols"]]))
+      aux_union_rows[bc,bcc] <- length(union(biclusters_merged[[bc]][["rows"]],
+                                             biclusters_merged[[bcc]][["rows"]]))
+      aux_union_cols[bc,bcc] <- length(union(biclusters_merged[[bc]][["cols"]],
+                                             biclusters_merged[[bcc]][["cols"]]))
+      aux_iou_rows[bc,bcc] <- round(aux_intersect_rows[bc,bcc]/aux_union_rows[bc,bcc],4)
+      aux_iou_cols[bc,bcc] <- round(aux_intersect_cols[bc,bcc]/aux_union_cols[bc,bcc],4)
+    }
+
+    # store computed IoU matrices
+    biclusters_merged[["iou_rows"]] <- aux_iou_rows
+    biclusters_merged[["iou_cols"]] <- aux_iou_cols
+    
+    # get highest IoU: jaccard index and bicluster indices
+    biclusters_merged[["iou_rows_max"]] <- off_diagonal_max(aux_iou_rows)
+    biclusters_merged[["iou_cols_max"]] <- off_diagonal_max(aux_iou_cols)
+    
+  }
+}
+
+# average of both IoU matrices
+aux_iou_avg <- matrix(0,nrow=n_biclust,ncol=n_biclust)
+for(i in 1:n_biclust){
+  for(j in 1:n_biclust){
+    aux_iou_avg[i,j] <- (biclusters_merged[['iou_rows']][i,j]+biclusters_merged[['iou_cols']][i,j])/2
+  }
+}
+
+# store computed average IoU matrix
+biclusters_merged[['iou_avg']] <- aux_iou_avg
+biclusters_merged[["iou_avg_max"]] <- off_diagonal_max(aux_iou_avg)
+
+aux_pos_rows <- unlist(biclusters_merged[["iou_rows_max"]][["positions"]])
+aux_pos_cols <- unlist(biclusters_merged[["iou_cols_max"]][["positions"]])
+aux_pos_avg <- unlist(biclusters_merged[["iou_avg_max"]][["positions"]])
+
+print(paste0('highest row overlap: IoU=', biclusters_merged[["iou_rows_max"]][["value"]]))
+bc_i <- aux_pos_rows[1]
+bc_j <- aux_pos_rows[2]
+
+aux_intersect_rows <- intersect(biclusters_merged[[aux_pos_rows[1]]][['rows']],biclusters_merged[[aux_pos_rows[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters_merged[[aux_pos_rows[1]]][['cols']],biclusters_merged[[aux_pos_rows[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_rows, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest column overlap: IoU=', biclusters_merged[["iou_cols_max"]][["value"]]))
+bc_i <- aux_pos_cols[1]
+bc_j <- aux_pos_cols[2]
+
+aux_intersect_rows <- intersect(biclusters_merged[[aux_pos_cols[1]]][['rows']],biclusters_merged[[aux_pos_cols[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters_merged[[aux_pos_cols[1]]][['cols']],biclusters_merged[[aux_pos_cols[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_cols, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+print('----------------------------------------')
+
+print(paste0('highest averaged overlap: IoU=', biclusters_merged[["iou_avg_max"]][["value"]]))
+bc_i <- aux_pos_avg[1]
+bc_j <- aux_pos_avg[2]
+
+aux_intersect_rows <- intersect(biclusters_merged[[aux_pos_avg[1]]][['rows']],biclusters_merged[[aux_pos_avg[2]]][['rows']])
+aux_intersect_cols <- intersect(biclusters_merged[[aux_pos_avg[1]]][['cols']],biclusters_merged[[aux_pos_avg[2]]][['cols']])
+
+print(paste(paste('clusters',paste(aux_pos_avg, collapse=" & ")),'have',
+            length(aux_intersect_rows),'samples &',
+            length(aux_intersect_cols),'features in common'))
+
+rm(aux_pos_rows,aux_pos_cols,aux_pos_avg,bc_i,bc_j,aux_intersect_rows,aux_intersect_cols,aux_union_rows,aux_union_cols,aux_iou_rows,aux_iou_cols,aux_iou_avg,bc,bcc)
+rm(i,j)
+```
+
+#### Visualize IoU matrices as heatmaps
+
+```{r heatmaps_iou}
+#| echo: false
+#| message: false
+#| warning: false
+
+heatmap(biclusters_merged[["iou_rows"]], Rowv=NA, Colv=NA, scale="none", main='IoU: rows')
+heatmap(biclusters_merged[["iou_cols"]], Rowv=NA, Colv=NA, scale="none", main='IoU: columns')
+heatmap(biclusters_merged[["iou_avg"]], Rowv=NA, Colv=NA, scale="none", main='averaged IoU: rows&columns')
+
+```
+
+#### Dendrograms: merged clusters (new numeration)
+
+```{r dendro_merged}
+#| echo: false
+#| message: false
+#| warning: false
+
+# Jaccard index to distance (1 - Jaccard index)
+distance_rows_m <- 1 - biclusters_merged[['iou_rows']]
+distance_cols_m <- 1 - biclusters_merged[['iou_cols']]
+distance_avg_m <- 1 - biclusters_merged[['iou_avg']]
+
+# hierarchical clustering
+# convert distance matrix to "dist" vector
+distance_rows_v <- as.dist(distance_rows_m)
+distance_cols_v <- as.dist(distance_cols_m)
+distance_avg_v <- as.dist(distance_avg_m)
+
+# use average linkage
+hc_rows <- hclust(distance_rows_v, method="average")
+hc_cols <- hclust(distance_cols_v, method="average")
+hc_avg <- hclust(distance_avg_v, method="average")
+
+#change merging threshold?
+#aux_thresh <- 0.55
+
+# plot dendrograms
+plot(hc_rows, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: row-wise similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Jrows(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_cols, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: column-wise similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Jcols(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+plot(hc_avg, labels = paste("BC", 1:n_biclust, sep=""),
+     main="Dendrogram: averaged row-column similarity",
+     xlab="Biclusters", ylab="Distance = 1 - Javerage(BCm,BCn)",sub='')
+abline(h = aux_thresh, col = "red", lty = 2, lwd = 2)
+
+```
+
+### Visualize all clusters in a matrix
+
+#### Order rows and columns by bicluster
+
+Get (reverse) order from the post-merge hierarchical clustering of biclusters
+
+```{r X_bc_order}
+#| echo: false
+#| message: false
+#| warning: false
+
+#choose normal or reverse order
+#aux_bc_order <- rev(hc_avg[["order"]])
+aux_bc_order <- hc_avg[["order"]]
+
+```
+
+Compute union of rows and columns of biclusters following the chosen order
+
+```{r X_bc_rowscols}
+#| echo: false
+#| message: false
+#| warning: false
+
+joinrows <- c()
+joincols <- c()
+
+for(bcc in aux_bc_order){
+  aux_pos <- which(aux_bc_order==bcc)
+  if(aux_pos<length(aux_bc_order)){
+    aux_x <- aux_bc_order[aux_pos]
+    aux_y <- aux_bc_order[aux_pos+1]
+    if(aux_pos==1){
+      #print(paste('comparing',aux_x,aux_y))
+      
+      #union without reordering. intersection first.
+      aux_x_rows <- biclusters_merged[[aux_x]][['rows']]
+      aux_x_cols <- biclusters_merged[[aux_x]][['cols']]
+      
+    }else{
+      #print(paste('comparing previous merge with',aux_y))
+      aux_x_rows <- aux_union_rows
+      aux_x_cols <- aux_union_cols
+      }
+    aux_y_rows <- biclusters_merged[[aux_y]][['rows']]
+    aux_y_cols <- biclusters_merged[[aux_y]][['cols']]
+    
+    aux_intersect_rows <- intersect(aux_x_rows,aux_y_rows)
+    aux_setdiff_rows <- setdiff(union(aux_x_rows,aux_y_rows),aux_intersect_rows)
+    aux_union_rows <- c(aux_intersect_rows,aux_setdiff_rows)
+
+        aux_intersect_cols <- intersect(aux_x_cols,aux_y_cols)
+    aux_setdiff_cols <- setdiff(union(aux_x_cols,aux_y_cols),aux_intersect_cols)
+    aux_union_cols <- c(aux_intersect_cols,aux_setdiff_cols)
+
+  }
+}
+
+
+
+rm(aux_pos,aux_x,aux_y,aux_x_rows,aux_x_cols,aux_y_rows,aux_y_cols,aux_intersect_rows,aux_intersect_cols,aux_setdiff_rows,aux_setdiff_cols)
+```
+
+#### Color-code elements by bicluster membership
+
+Assigns the bicluster number to each element, assigns n_biclust + 1 to overlapping elements. Any unassigned element is set to zero.
+
+```{r X_color_assign}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xcolor <- X
+Xcolor[,] <- NA
+for(bcc in aux_bc_order){
+  aux_rows <- biclusters_merged[[bcc]][['rows']]
+  aux_cols <- biclusters_merged[[bcc]][['cols']]
+  for(i in aux_rows){
+    for(j in aux_cols){
+      if(is.na(Xcolor[i,j])){ #if the element is empty, assign a cluster number as label
+        Xcolor[i,j]<-bcc
+      }else{ #if it already contains a value (overlap), assign a very large number as label
+        Xcolor[i,j]<-n_biclust_merged+1
+      }
+      
+    }
+  }
+}
+
+Xcolor[is.na(Xcolor)] <- 0
+```
+
+#### Biclusters in matrix: clustered rows and columns only
+
+Rows and columns ordered and grouped by cluster membership. Creates a rainbow pallette using the number of biclusters. Unassigned elements are black, overlapping elements are white.
+
+```{r X_bc_sub}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_colors <- c('#000000',rainbow(n_biclust_merged),'#ffffff')
+
+heatmap(Xcolor[aux_union_rows,aux_union_cols], Rowv=NA, Colv=NA, scale="none", main='Clusters in a subset of X',col = aux_colors,cexRow=0.5,cexCol=0.1)
+
+colorLegend <- aux_colors
+legend("topright",legend = c('none',1:n_biclust_merged,'overlap'),
+       fill=colorLegend, title = "bicluster")
+
+
+heatmap(Xbin[aux_union_rows,aux_union_cols], Rowv=NA, Colv=NA, scale="none", main='Binarized X (clustered columns)',cexRow=0.5,cexCol=0.1)
+
+```
+
+#### Biclusters in X
+
+Rows and columns ordered and grouped by cluster membership, unclustered columns on the left, unclustered rows on the bottom (if any)
+
+```{r X_bc}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_union_rows_X <- c(aux_union_rows,setdiff(1:I,aux_union_rows))
+aux_union_cols_X <- c(aux_union_cols,setdiff(1:J,aux_union_cols))
+
+heatmap(Xcolor[aux_union_rows_X,aux_union_cols_X], Rowv=NA, Colv=NA, scale="none", main='Clusters in X',col = aux_colors,cexRow=0.5,cexCol=0.1)
+
+colorLegend <- aux_colors
+legend("topright",legend = c('none',1:n_biclust_merged,'overlap'),
+       fill=colorLegend, title = "bicluster")
+```
+
+### Visualize individual clusters
+
+```{r bc_all_view}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+  
+  if(stats_bc_merged[stats_bc_merged$bc==bcc,'rows']<=20){aux_cexrow<-1}else{aux_cexrow<-0.5}
+  if(stats_bc_merged[stats_bc_merged$bc==bcc,'cols']<=40){aux_cexcol<-1}else{
+    if(stats_bc_merged[stats_bc_merged$bc==bcc,'cols']<=100){
+      aux_cexcol<-0.25
+      }else{
+        aux_cexcol<-0.1
+      }
+    }
+  
+  aux_matrix <- as.matrix(sqrt(sqrt(biclusters_merged[[bcc]][['C']])))
+  heatmap(aux_matrix, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',bcc),cexRow=aux_cexrow,cexCol=aux_cexcol)
+}
+
+
+```
+
+### Biological relevance
+
+Identify by index: study groups and dysbiotic status in the samples, class and family of taxa.
+
+Sample subsets:
+
+-   3 study groups
+
+-   2 dysbiotic status
+
+Taxonomy:
+
+-   10 phyla
+
+-   17 classes
+
+-   48 families
+
+```{r bio_samples}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+    aux_meta <- X_meta[biclusters_merged[[bcc]][["rows"]],]
+    biclusters_merged[[bcc]][['diagnosis']] <- as.matrix(table(aux_meta$diagnosis))
+    biclusters_merged[[bcc]][['dysbiotic']] <- as.matrix(table(aux_meta$dysbiotic))
+}
+
+ind_meta_diag <- vector('list')
+for(d in unique(X_meta$diagnosis)){
+  ind_meta_diag[[d]] <- which(X_meta$diagnosis==d)
+}
+
+X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
+ind_meta_dysb <- vector('list')
+for(d in unique(X_meta$dysbiotic)){
+  ind_meta_dysb[[d]] <- which(X_meta$dysbiotic==d)
+}
+```
+
+```{r bio_taxa}
+#| echo: false
+#| message: false
+#| warning: false
+
+for(bcc in 1:n_biclust){
+    aux_taxo <- X_taxo[biclusters_merged[[bcc]][["cols"]],]
+    biclusters_merged[[bcc]][['phylum']] <- as.matrix(table(aux_taxo$phylum))
+    biclusters_merged[[bcc]][['class']] <- as.matrix(table(aux_taxo$class))
+    biclusters_merged[[bcc]][['family']] <- as.matrix(table(aux_taxo$family))
+}
+
+ind_taxo_phylum <- vector('list')
+for(t in unique(X_taxo$phylum)){
+  ind_taxo_phylum[[t]] <- which(X_taxo$phylum==t)
+}
+ind_taxo_class <- vector('list')
+for(t in unique(X_taxo$class)){
+  ind_taxo_class[[t]] <- which(X_taxo$class==t)
+}
+ind_taxo_family <- vector('list')
+for(t in unique(X_taxo$family)){
+  ind_taxo_family[[t]] <- which(X_taxo$family==t)
+}
+```
+
+For each bicluster, list the distribution of diagnosis and dysbiosis.
+
+As counts:
+
+```{r bc_diag_dysb}
+#| echo: false
+#| message: false
+#| warning: false
+
+
+for(bcc in 1:n_biclust){
+  print(paste0('BC',bcc))
+  print('diagnosis:')
+  for(d in unique(X_meta$diagnosis)){
+    aux_intersect<- length(intersect(biclusters_merged[[bcc]][['rows']],ind_meta_diag[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('dysbiotic:')
+  for(d in unique(X_meta$dysbiotic)){
+    aux_intersect <- length(intersect(biclusters_merged[[bcc]][['rows']],ind_meta_dysb[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+}
+```
+
+Identifying individual samples:
+
+```{r bc_diag_dysb_table}
+for(bcc in 1:n_biclust){
+  aux_rows <- biclusters_merged[[bcc]][['rows']]
+  print(X_meta[aux_rows,c('diagnosis','dysbiotic')])
+}
+```
+
+For each bicluster, list the distribution by phylum, class, family.
+
+```{r bc_taxo}
+for(bcc in 1:n_biclust){
+  print(paste0('BC',bcc))
+  print('phylum:')
+  for(d in unique(X_taxo$phylum)){
+    aux_intersect<- length(intersect(biclusters_merged[[bcc]][['cols']],ind_taxo_phylum[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+  print('class:')
+  for(d in unique(X_taxo$class)){
+    aux_intersect<- length(intersect(biclusters_merged[[bcc]][['cols']],ind_taxo_class[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('--------------------')
+  print('family:')
+  for(d in unique(X_taxo$family)){
+    aux_intersect<- length(intersect(biclusters_merged[[bcc]][['cols']],ind_taxo_family[[d]]))
+    if(aux_intersect>0){print(paste(d,':',aux_intersect))}
+  }
+  print('----------------------------------------')
+}
+```
+
+### 
+
+### Inspect a single cluster
+
+Create a temporary object with the bicluster, selected by number.
+
+```{r bc_singgle}
+
+BC <- 1
+aux_bc <- as.matrix(biclusters_merged[[BC]][['C']])
+
+```
+
+```{r hc_inspect_meta}
+#| echo: false
+#| message: false
+#| warning: false
+
+#input a study group and a dysbiotic status of interest
+aux_diag <- 'IBD_CD'
+aux_dysb <- 'T'
+
+#number of results for median taxonomic abundance
+aux_n <- 10
+
+#convert TRUE and FALSE to T and F
+X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
+
+#get row names of all samples and of nonzero taxa in the cluster
+aux_samples <- rownames(aux_bc)
+aux_taxa <- colnames(aux_bc)
+
+#get the metadata and taxonomy of the clustered rows and the nonzero taxa
+X_meta_bc <- X_meta[aux_samples,]
+X_taxo_bc <- X_taxo[aux_taxa,]
+
+#visualize the group distribution of the selection of samples
+as.data.frame(table(X_meta_bc$diagnosis)) #samples by diagnosis
+as.data.frame(table(X_meta_bc$dysbiotic)) #samples by dysbiotic status
+as.data.frame(table(X_taxo_bc$class)) #taxa by class
+as.data.frame(table(X_taxo_bc$family)) #taxa by family
+
+#select a diagnosis and get a submatrix from the bicluster
+X_meta_bc_diag <- X_meta_bc[X_meta_bc$diagnosis==aux_diag,]
+aux_bc_diag <- aux_bc[rownames(X_meta_bc_diag),]
+
+#select by dysbiotic status and get a submatrix from the bicluster
+X_meta_bc_dysb <- X_meta_bc[X_meta_bc$dysbiotic==aux_dysb,]
+aux_bc_dysb <- aux_bc[rownames(X_meta_bc_dysb),]
+
+#visualize the selections to find patterns
+heatmap(aux_bc_diag, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluster',BC,' (',aux_diag,')'),cexRow=1,cexCol=0.25)
+
+heatmap(aux_bc_dysb, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluster',BC, '(',
+                                                                ifelse(aux_dysb=='T','','non-'),'dysbiotic)'),cexRow=1,cexCol=0.25)
+
+#keep only nonzero taxa
+aux_bc_diag <- aux_bc_diag[,aux_taxa]
+aux_bc_dysb <- aux_bc_dysb[,aux_taxa]
+
+#get the median abundance of taxa by diagnosis and by dysbiotic status
+#by diagnostic
+aux_bc_diag_colsum_median <- apply(aux_bc_diag,2,median)
+print(paste('Top ',aux_n,' median abundance taxa in',paste0('BC',BC),aux_diag,':'))
+head(sort(aux_bc_diag_colsum_median[aux_bc_diag_colsum_median>0], decreasing = TRUE),n=aux_n)
+print('----------------------------------------')
+print(paste('Bottom ',aux_n,' median abundance taxa in',paste0('BC',BC),aux_diag,':'))
+head(sort(aux_bc_diag_colsum_median[aux_bc_diag_colsum_median>0], decreasing = FALSE),n=aux_n)
+
+print('========================================')
+#by dysbiosis
+aux_bc_dysb_colsum_median <- apply(aux_bc_dysb,2,median)
+print(paste0('Top ',aux_n,' median abundance taxa in ',paste0('BC',BC),ifelse(aux_dysb=='T','','non-'),' dysbiotic:'))
+head(sort(aux_bc_dysb_colsum_median[aux_bc_dysb_colsum_median>0], decreasing = TRUE),n=aux_n)
+print('----------------------------------------')
+print(paste0('Bottom ',aux_n,' median abundance taxa in ',paste0('BC',BC),ifelse(aux_dysb=='T','','non-'),'d ysbiotic:'))
+head(sort(aux_bc_dysb_colsum_median[aux_bc_dysb_colsum_median>0], decreasing = FALSE),n=aux_n)
+
+```
+
+### 

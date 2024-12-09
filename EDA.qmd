@@ -501,19 +501,19 @@ aux_c_dysb <- aux_c_dysb[,aux_taxa]
 #get the median abundance of taxa by diagnosis and by dysbiotic status
 #by diagnostic
 aux_c_diag_colsum_median <- apply(aux_c_diag,2,median)
-print(paste('Top 10 median abundance taxa in',aux_diag,':'))
+print(paste('Top',aux_n,'median abundance taxa in',paste('Cluster',cc),aux_diag,':'))
 head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = TRUE),n=aux_n)
 print('----------------------------------------')
-print(paste('Bottom 10 median abundance taxa in',aux_diag,':'))
+print(paste('Bottom',aux_n,'median abundance taxa in',paste('Cluster',cc),aux_diag,':'))
 head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = FALSE),n=aux_n)
 
 print('========================================')
 #by dysbiosis
 aux_c_dysb_colsum_median <- apply(aux_c_dysb,2,median)
-print(paste0('Top 10 median abundance taxa in ',ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
+print(paste0('Top',aux_n,'median abundance taxa in ',paste('Cluster',cc),ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
 head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = TRUE),n=aux_n)
 print('----------------------------------------')
-print(paste0('Bottom 10 median abundance taxa in ',ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
+print(paste0('Bottom',aux_n,'median abundance taxa in ',paste('Cluster',cc),ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
 head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = FALSE),n=aux_n)
 
 ```

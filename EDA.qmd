@@ -438,55 +438,84 @@ for(cc in aux_1sample){
 
 ### Inspect a single cluster
 
-Create a temporary object with the bicluster, selected by number.
+Create a temporary object with the bicluster, selected by number. Verify distances between its samples.
 
-```{r}
+```{r hc_inspect_single}
+#| echo: false
+#| message: false
+#| warning: false
 
 cc <- 3
 aux_c <- Xorig[names(clusterCut[clusterCut==cc]),]
 as.matrix(dist(aux_c))
 ```
 
-```{r}
+```{r hc_inspect_meta}
+#| echo: false
+#| message: false
+#| warning: false
 
+#input a study group and a dysbiotic status of interest
+aux_diag <- 'IBD_CD'
+aux_dysb <- 'T'
+
+#number of results for median taxonomic abundance
+aux_n <- 10
+
+#convert TRUE and FALSE to T and F
 X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
 
 #get row names of all samples and of nonzero taxa in the cluster
 aux_samples <- names(clusterCut[clusterCut==cc])
-aux_taxa <- 1:J
-names(aux_taxa) <- colnames(X)
+aux_taxa <- which(colSums(aux_c)!=0)
 
-#get the metadata and taxonomy of the selected rows and samples
+#get the metadata and taxonomy of the clustered rows and the nonzero taxa
 X_meta_c <- X_meta[aux_samples,]
 X_taxo_c <- X_taxo[aux_taxa,]
 
-#visualize the distribution of the selection
+#visualize the group distribution of the selection of samples
 as.data.frame(table(X_meta_c$diagnosis)) #samples by diagnosis
 as.data.frame(table(X_meta_c$dysbiotic)) #samples by dysbiotic status
 as.data.frame(table(X_taxo_c$class)) #taxa by class
 as.data.frame(table(X_taxo_c$family)) #taxa by family
 
 #select a diagnosis and get a submatrix from the bicluster
-X_meta_c_diag <- X_meta_c[X_meta_c$diagnosis=='IBD_CD',]
+X_meta_c_diag <- X_meta_c[X_meta_c$diagnosis==aux_diag,]
 aux_c_diag <- aux_c[rownames(X_meta_c_diag),]
 
 #select by dysbiotic status and get a submatrix from the bicluster
-X_meta_c_dysb <- X_meta_c[X_meta_c$dysbiotic=='T',]
+X_meta_c_dysb <- X_meta_c[X_meta_c$dysbiotic==aux_dysb,]
 aux_c_dysb <- aux_c[rownames(X_meta_c_dysb),]
 
 #visualize the selections to find patterns
-heatmap(aux_c_diag, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',cc,'(IBD_CD)'),cexRow=1,cexCol=0.25)
+heatmap(aux_c_diag, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluste r',cc,' (',aux_diag,')'),cexRow=1,cexCol=0.25)
 
-heatmap(aux_c_dysb, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',cc,'(dysbiotic)'),cexRow=1,cexCol=0.25)
+heatmap(aux_c_dysb, Rowv=NA, Colv=NA, scale="none", main=paste0('Cluster ',cc,' (',
+                                                                ifelse(aux_dysb=='T','','non-'),
+                                                                'dysbiotic)'),cexRow=1,cexCol=0.25)
+
+#keep only nonzero taxa
+aux_c_diag <- aux_c_diag[,aux_taxa]
+aux_c_dysb <- aux_c_dysb[,aux_taxa]
 
 #get the median abundance of taxa by diagnosis and by dysbiotic status
+#by diagnostic
 aux_c_diag_colsum_median <- apply(aux_c_diag,2,median)
-print('Top 10 median abundance taxa in CD:')
-head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = TRUE),n=10)
+print(paste('Top 10 median abundance taxa in',aux_diag,':'))
+head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = TRUE),n=aux_n)
 print('----------------------------------------')
+print(paste('Bottom 10 median abundance taxa in',aux_diag,':'))
+head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = FALSE),n=aux_n)
+
+print('========================================')
+#by dysbiosis
 aux_c_dysb_colsum_median <- apply(aux_c_dysb,2,median)
-print('Top 10 median abundance taxa in DYSBIOTIC:')
-head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = TRUE),n=10)
+print(paste0('Top 10 median abundance taxa in ',ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
+head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = TRUE),n=aux_n)
+print('----------------------------------------')
+print(paste0('Bottom 10 median abundance taxa in ',ifelse(aux_dysb=='T','','non-'),'dysbiotic:'))
+head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = FALSE),n=aux_n)
+
 ```
 
 ```         

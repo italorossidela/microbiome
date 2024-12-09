@@ -1,0 +1,493 @@
+---
+title: "Microbiome Data Analysis Using Biclustering Approaches - Initial Exploratory Data Analysis"
+author: "Italo Rossi del Aguila"
+format: pdf
+editor: visual
+---
+
+```{r load_pk, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+library(tidyr)
+library(dplyr)
+library(vegan) #for rarefaction
+library(cluster)
+```
+
+# Initial Exploratory Analysis
+
+## 16S IBD
+
+The present work will use a data set derived from Lloyd-Price et al. (2019). This study investigates the gut microbiome of individuals with two types of inflammatory bowel disease, namely Crohn's disease (IBD_CD) and ulcerative colitis (IBD_UC) in comparison to healthy individuals (HC, for healthy controls). Specifically, we will be using only one sample per individual for all three study groups: 43 samples and 668 OTUs.
+
+The chosen data set has been rarefied (downsampled) so all samples have the same sequencing depth: 1538 reads. Three study groups are identified in the accompanying metadata: two groups of inflammatory bowel disease groups: Crohn's disease (IBD_CD -- 17 samples), ulcerative colitis (IBD_UC -- 12 samples) and healthy controls (HC, 14 samples). Each sample receives a dysbiosis score, from which a dysbiotic status is determined as TRUE or FALSE: this is calculated by taking the median Bray-Curtis dissimilarity of each sample compared to a reference sample set (excluding samples taken from the same subject; details in the Methods section of Lloyd-Price et al., 2019).
+
+### Import data
+
+-   **X**: nonnegative integer data matrix
+
+    -   Transpose so samples are in the rows and features in the columns
+
+-   **X~meta~**: sample metadata
+
+-   **X~taxo~**: feature taxonomy
+
+```{r data_load, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+X <- read.delim("data/microbiome_dataSet1.tsv",row.names=1)
+X <- t(as.matrix(X))
+X_meta <- read.delim("data/microbiome_dataSet1_sampleInfo.tsv",row.names=1)
+X_taxo <- read.delim("data/microbiome_dataSet1_taxonomy.tsv",row.names=1)
+```
+
+### Initial Filtering
+
+Make sure all null (NA) elements are set to zero. Any all-zero rows and columns are removed.
+
+```{r data_trns, include=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+#NAs to zeros
+X[is.na(X)] <- 0
+
+#remove all-zero samples
+aux_allzero <- which(rowSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[-aux_allzero,]
+}
+
+#remove all-zero taxa
+aux_allzero <- which(colSums(X)==0)
+if(length(aux_allzero)>0){
+  X <- X[,-aux_allzero]
+}
+
+rm(aux_allzero)
+
+if(any(X<0)){
+  print("X has negative values. DO NOT CONTINUE.")
+}
+
+I <- dim(X)[1]; J <- dim(X)[2]
+```
+
+### Breakdown by study group and dysbiotic status
+
+```{r EDA_table}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_table <- X_meta %>%
+  count(diagnosis, dysbiotic) %>%
+  # Reshape the data to have dysbiotic as columns (TRUE/FALSE)
+  pivot_wider(names_from = dysbiotic, values_from = n, values_fill = 0) %>%
+  # Rename columns to indicate TRUE/FALSE
+  rename(Dysbiotic_True = `TRUE`, Dysbiotic_False = `FALSE`)
+
+# Print the table
+print(aux_table)
+rm(aux_table)
+```
+
+### Sparsity and nonzero elements
+
+Proportion of zeros in the matrix:
+
+```{r EDA_sparsity_pre}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_sparsity <- round(length(which(X==0))/(I*J)*100,2)
+print(paste0('the matrix is ',aux_sparsity,'% sparse before filtering rare taxa'))
+
+rm(aux_sparsity)
+```
+
+Distribution/skew of nonzero elements:
+
+```{r EDA_nonzero_pre}
+#| echo: false
+#| message: false
+#| warning: false
+
+hist(X[which(X>0)], breaks=50, main='Distribution of nonzero elements',xlab="reads per sample-OTU pair")
+summary(X[which(X>0)])
+```
+
+### OTU analysis: rarity and number of species
+
+Verify sequencing depth is the same across all samples:
+
+```{r seqdepth_pre}
+#| echo: false
+#| message: false
+#| warning: false
+
+summary(rowSums(X))
+```
+
+OTU rarity: proportion of samples containing each of the species:
+
+```{r OTU_rarity_pre}
+#| echo: false
+#| message: false
+#| warning: false
+aux_hist <- apply(X, 2, function(x) 100*length(which(x>0))/length(x))
+hist(aux_hist, xlab='% samples with species',ylab='OTUs',main='OTU rarity',las=1,breaks=50)
+summary(aux_hist)
+rm(aux_hist)
+```
+
+Number of species per sample:
+
+```{r species_pre}
+#| echo: false
+#| message: false
+#| warning: false
+
+hist(specnumber(X),breaks=50, xlab='OTUs',ylab='samples', main='number of species per sample')
+summary(specnumber(X))
+```
+
+### Preprocessing
+
+#### Binarization
+
+Presence/absence matrix, basis for Bibit
+
+$$
+f(x) =
+\begin{cases} 
+1 & \text{if } x > 0, \\
+0 & \text{otherwise.}
+\end{cases}
+$$
+
+```{r trns_bin_pre}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xbin <- X
+Xbin[Xbin>0] <- 1
+```
+
+#### Square root transform
+
+Variance stabilization, useful for factorization with NMF-NNSMR. **X** is backed up to **X**~orig~
+
+```{r trns_sqrt_pre}
+#| echo: false
+#| message: false
+#| warning: false
+Xorig <- X
+X <- sqrt(X)
+Xsqrt <- X
+```
+
+### Heatmaps
+
+Visualize the **X**, **X~orig~** and **X~sqrt~**
+
+```{r plot_heatmaps_pre}
+#| echo: false
+#| message: false
+#| warning: false
+heatmap(Xorig, Rowv=NA, Colv=NA, scale="none", main="X", cexRow=0.5, cexCol=0.1)
+heatmap(Xsqrt, Rowv=NA, Colv=NA, scale="none", main="X (sqrt transform)", cexRow=0.5, cexCol=0.1)
+heatmap(Xbin, Rowv=NA, Colv=NA, scale="none", main="X (binarized)", cexRow=0.5, cexCol=0.1)
+```
+
+## 16S IBD - Filtered
+
+If filtering is not applied, proceed directly to the [Hierarchical Clustering] section.
+
+### Filtering rare taxa
+
+Find and remove rare taxa: OTUs with only one count across all samples
+
+```{r EDA_filter}
+#| echo: false
+#| message: false
+#| warning: false
+
+#restore raw data
+X <- Xorig
+
+aux_rare <- which(colSums(X)==1)
+X <- X[,-aux_rare]
+
+#update dimension variables
+I <- dim(X)[1]; J <- dim(X)[2]
+
+rm(aux_rare)
+```
+
+### Sparsity and nonzero elements
+
+Proportion of zeros in the matrix:
+
+```{r EDA_sparsity_post}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_sparsity <- round(length(which(X==0))/(I*J)*100,2)
+print(paste0('the matrix is ',aux_sparsity,'% sparse after filtering rare taxa'))
+
+rm(aux_sparsity)
+```
+
+Distribution/skew of nonzero elements:
+
+```{r EDA_nonzero_post}
+#| echo: false
+#| message: false
+#| warning: false
+
+hist(X[which(X>0)], breaks=50, main='Distribution of nonzero elements',xlab="reads per sample-OTU pair")
+summary(X[which(X>0)])
+```
+
+### OTU analysis: rarity and number of species
+
+Verify changes in sequencing depth across all samples after filtering:
+
+```{r seqdepth_post}
+#| echo: false
+#| message: false
+#| warning: false
+
+hist(rowSums(X),main='Sequencing depth after filtering',xlab='Reads per sample',ylab='samples',breaks=10)
+summary(rowSums(X))
+```
+
+OTU rarity: proportion of samples containing each of the species:
+
+```{r OTU_rarity_post}
+#| echo: false
+#| message: false
+#| warning: false
+aux_hist <- apply(X, 2, function(x) 100*length(which(x>0))/length(x))
+hist(aux_hist, xlab='% samples with species',ylab='OTUs',main='OTU rarity after filtering',las=1,breaks=50)
+summary(aux_hist)
+rm(aux_hist)
+```
+
+Number of species per sample:
+
+```{r species_post}
+#| echo: false
+#| message: false
+#| warning: false
+
+hist(specnumber(X),breaks=50, xlab='OTUs',ylab='samples', main='number of species per sample after filtering')
+summary(specnumber(X))
+```
+
+### Preprocessing
+
+#### Binarization
+
+```{r trns_bin}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xbin <- X
+Xbin[Xbin>0] <- 1
+```
+
+#### Square root transform
+
+```{r trns_sqrt}
+#| echo: false
+#| message: false
+#| warning: false
+
+Xorig <- X
+X <- sqrt(X)
+Xsqrt <- X
+```
+
+### Heatmaps
+
+```{r plot_heatmaps}
+#| echo: false
+#| message: false
+#| warning: false
+
+heatmap(Xorig, Rowv=NA, Colv=NA, scale="none", main="X (filtered)", cexRow=0.5, cexCol=0.1)
+heatmap(Xsqrt, Rowv=NA, Colv=NA, scale="none", main="X (filtered + sqrt transform)", cexRow=0.5, cexCol=0.1)
+heatmap(Xbin, Rowv=NA, Colv=NA, scale="none", main="X (filtered + binarized)", cexRow=0.5, cexCol=0.1)
+```
+
+# Hierarchical Clustering
+
+Perform hierarchical clustering on the samples using the Euclidean distance and average linkage across all features.
+
+```{r hc}
+#| echo: false
+#| message: false
+#| warning: false
+d_IBD <- dist(Xorig,method = "euclidean")
+hc_IBD <- hclust(d_IBD, method = "average")
+plot(hc_IBD,cex=0.5)
+clusterCut <- cutree(hc_IBD, 9)
+print('study groups by cluster')
+table(clusterCut, X_meta$diagnosis)
+print('----------------------------------------')
+print('dysbiotic status by cluster')
+table(clusterCut, X_meta$dysbiotic)
+
+```
+
+### Check inter-sample distance and similarity
+
+Manually inspect the computed distances and Jaccard Index (IoU) for any pair of samples by sample name Using the dendrogram above, compare the distance and similarity between any two samples.
+
+```{r hc_inspect_samples}
+#| echo: false
+#| message: false
+#| warning: false
+
+s1 <- X['M2042C18',] #sample 1
+s2 <- X['H4023C13',] #sample 2
+as.matrix(dist(rbind(s1,s2))) #display computed distance
+
+#get nonzero features in each sample
+s1_t <- which(s1!=0)
+s2_t <- which(s2!=0)
+#calculate the intersection over union
+aux_iou <- length(intersect(s1_t,s2_t))/length(union(s1_t,s2_t))
+print(paste0('IoU_cols =',round(aux_iou,2)))
+
+```
+
+### Inspect and plot clusters
+
+Presence/absence heatmaps to illustrate the sparsity of the resulting clusters. Text output indicates:
+
+-   Number of features present in all samples in the cluster
+
+-   Number of features containing no counts in any of the samples in the cluster.
+
+```{r hc_inspect_clusters}
+#| echo: false
+#| message: false
+#| warning: false
+
+#empty object to store 'orphan' samples (not clustered)
+aux_1sample <- c()
+
+for(bcc in unique(clusterCut)){
+  aux_samples <- clusterCut[clusterCut==bcc]
+  if(length(aux_samples)>1){
+    aux_C <- Xbin[names(aux_samples),]
+    heatmap(aux_C, Rowv=NA, Colv=NA, scale="none", main=paste0("HC",bcc), cexRow=0.5, cexCol=0.1)
+    
+    print(paste0('Cluster ',bcc,':'))
+    print(paste0(length(which(colSums(aux_C)==nrow(aux_C))),' features have counts on all ',nrow(aux_C),' samples'))
+    print(paste0(length(which(colSums(aux_C)==0)),' features have no counts in any of the ',nrow(aux_C),' samples'))
+    print('')
+    print('features present in ___ samples')
+    print(table(colSums(aux_C)))
+    
+  }
+  else{
+    print(paste('Cluster',bcc,'has only one sample'))
+    aux_1sample <- c(aux_1sample, names(clusterCut[clusterCut==bcc]))
+  }
+  print('----------------------------------------')
+}
+
+
+
+
+
+print('')
+print('samples in single-sample clusters')
+aux_1sample
+```
+
+Visualize all single-sample clusters in a heatmap to illustrate their individual sparsity.
+
+```{r hc_1sample}
+#| echo: false
+#| message: false
+#| warning: false
+
+aux_1sample_m <- Xbin[aux_1sample,]
+heatmap(aux_1sample_m, Rowv=NA, Colv=NA, scale="none", main='single-sample clusters', cexRow=0.5, cexCol=0.1)
+
+as.matrix(dist(aux_1sample_m))
+
+for(cc in aux_1sample){
+  print(paste('sample',cc,'has',length(which(Xbin[cc,]==0)),'taxa without reads'))
+}
+```
+
+### 
+
+### Inspect a single cluster
+
+Create a temporary object with the bicluster, selected by number.
+
+```{r}
+
+cc <- 3
+aux_c <- Xorig[names(clusterCut[clusterCut==cc]),]
+as.matrix(dist(aux_c))
+```
+
+```{r}
+
+X_meta$dysbiotic <- ifelse(X_meta$dysbiotic,'T','F')
+
+#get row names of all samples and of nonzero taxa in the cluster
+aux_samples <- names(clusterCut[clusterCut==cc])
+aux_taxa <- 1:J
+names(aux_taxa) <- colnames(X)
+
+#get the metadata and taxonomy of the selected rows and samples
+X_meta_c <- X_meta[aux_samples,]
+X_taxo_c <- X_taxo[aux_taxa,]
+
+#visualize the distribution of the selection
+as.data.frame(table(X_meta_c$diagnosis)) #samples by diagnosis
+as.data.frame(table(X_meta_c$dysbiotic)) #samples by dysbiotic status
+as.data.frame(table(X_taxo_c$class)) #taxa by class
+as.data.frame(table(X_taxo_c$family)) #taxa by family
+
+#select a diagnosis and get a submatrix from the bicluster
+X_meta_c_diag <- X_meta_c[X_meta_c$diagnosis=='IBD_CD',]
+aux_c_diag <- aux_c[rownames(X_meta_c_diag),]
+
+#select by dysbiotic status and get a submatrix from the bicluster
+X_meta_c_dysb <- X_meta_c[X_meta_c$dysbiotic=='T',]
+aux_c_dysb <- aux_c[rownames(X_meta_c_dysb),]
+
+#visualize the selections to find patterns
+heatmap(aux_c_diag, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',cc,'(IBD_CD)'),cexRow=1,cexCol=0.25)
+
+heatmap(aux_c_dysb, Rowv=NA, Colv=NA, scale="none", main=paste('Cluster',cc,'(dysbiotic)'),cexRow=1,cexCol=0.25)
+
+#get the median abundance of taxa by diagnosis and by dysbiotic status
+aux_c_diag_colsum_median <- apply(aux_c_diag,2,median)
+print('Top 10 median abundance taxa in CD:')
+head(sort(aux_c_diag_colsum_median[aux_c_diag_colsum_median>0], decreasing = TRUE),n=10)
+print('----------------------------------------')
+aux_c_dysb_colsum_median <- apply(aux_c_dysb,2,median)
+print('Top 10 median abundance taxa in DYSBIOTIC:')
+head(sort(aux_c_dysb_colsum_median[aux_c_dysb_colsum_median>0], decreasing = TRUE),n=10)
+```
+
+```         
+```
